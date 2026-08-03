@@ -6,12 +6,18 @@ Trellis lets you build AI agents and multi-step agent workflows in idiomatic C#.
 
 No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/microsoft-extensions-ai), so it works with any provider that ships an `IChatClient` — OpenAI, Anthropic, Azure OpenAI, Ollama, and more.
 
-> ⚠️ Early release (v0.1). The API is small on purpose and will evolve.
+> ⚠️ Early release (v0.2). The API is small on purpose and will evolve.
 
 ## Features
 
 - 🎯 **Strongly-typed agent outputs** — ask for an `Agent<FlightResult>` and get a `FlightResult` back, not a string to parse. Structured JSON output and deserialization are handled for you.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
+- ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
+- 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
+- 🤝 **Agents as graph nodes** — `AddAgentNode(...)` drops any agent into a workflow: build the prompt from state, fold the typed result back in.
+- 🔀 **Parallel fan-out/fan-in** — `AddParallelNode(...)` runs branches concurrently against the same state and merges the results.
+- ✋ **Human-in-the-loop interrupts** — pause a run in front of any node (`InterruptBefore`), let a human review or edit the state, then resume from the same thread id.
+- 🗄️ **Durable SQLite checkpointing** — `Trellis.Checkpointing.Sqlite` persists progress to a database file; workflows survive crashes and process restarts.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
 - 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
@@ -45,6 +51,28 @@ var agent = new Agent<FlightResult>(client,
         name: "search_flights")]);
 ```
 
+Or let the source generator discover them — mark methods with `[Tool]` on a `partial` class and a `CreateTools()` method is generated at compile time:
+
+```csharp
+public partial class FlightTools
+{
+    [Tool(Description = "Searches for the cheapest flight to a city")]
+    public string SearchFlights(string city) => /* ... */;   // exposed as "search_flights"
+}
+
+var agent = new Agent<FlightResult>(client, tools: new FlightTools().CreateTools());
+```
+
+Need your services inside tools? `Agent<TDeps, TResult>` builds the tool set per run from a typed dependencies object:
+
+```csharp
+var agent = new Agent<OrderServices, OrderSummary>(client,
+    tools: deps => [AIFunctionFactory.Create(
+        () => deps.Db.GetOrders(deps.CurrentUserId), name: "list_orders")]);
+
+OrderSummary summary = (await agent.RunAsync(services, "summarize my orders")).Output;
+```
+
 ## Graph workflows
 
 Nodes transform a state object; edges decide what runs next; every step can be checkpointed.
@@ -72,12 +100,37 @@ await foreach (var evt in graph.StreamAsync(new ResearchState("...", null, 0)))
 
 Reuse a `ThreadId` in `GraphRunOptions` and a crashed or interrupted workflow resumes from its latest checkpoint instead of starting over.
 
+Agents drop straight into a graph, branches can fan out in parallel, and runs can pause for a human:
+
+```csharp
+var graph = new StateGraph<ResearchState>()
+    .AddAgentNode("draft", draftAgent,
+        prompt: s => s.Question,
+        apply: (s, output) => s with { Draft = output })
+    .AddParallelNode("factcheck",
+        branches: [CheckSourcesAsync, CheckToneAsync],
+        merge: (input, results) => Merge(input, results))
+    .AddEdge("draft", "factcheck")
+    .AddEdge("factcheck", "publish")
+    .AddNode("publish", PublishAsync)
+    .SetEntryPoint("draft")
+    .Compile(SqliteCheckpointer<ResearchState>.FromFile("workflows.db"));
+
+// Pause before publishing so a human can approve or edit the draft:
+var options = new GraphRunOptions { ThreadId = "wf-1", InterruptBefore = ["publish"] };
+var paused = await graph.RunAsync(initialState, options);          // Status: Interrupted
+
+await graph.UpdateStateAsync("wf-1", s => s with { Draft = editedDraft });
+var done = await graph.RunAsync(initialState, options);            // resumes → Completed
+```
+
 ## Packages
 
 | Package | What's in it |
 |---|---|
-| `Trellis` | Typed agents (`Agent<TResult>`) on `IChatClient` |
-| `Trellis.Graph` | Graph runtime: `StateGraph<TState>`, streaming, checkpointing (no AI dependency — usable for any workflow) |
+| `Trellis` | Typed agents (`Agent<TResult>`, `Agent<TDeps, TResult>`), the `[Tool]` source generator, and agent-as-node graph helpers |
+| `Trellis.Graph` | Graph runtime: `StateGraph<TState>`, parallel branches, streaming, interrupts, checkpointing (no AI dependency — usable for any workflow) |
+| `Trellis.Checkpointing.Sqlite` | Durable SQLite-backed checkpointer for graph workflows |
 
 ## Building
 
@@ -89,13 +142,17 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 
 ## Roadmap
 
-- [ ] Source-generated tool discovery (`[Tool]` attribute → `AIFunction`, zero reflection)
-- [ ] `Agent<TDeps, TResult>` — compile-time-checked dependency injection into tools
-- [ ] Agent-as-node helpers bridging `Trellis` and `Trellis.Graph`
-- [ ] Parallel fan-out/fan-in branches
-- [ ] `Trellis.Checkpointing.Sqlite` durable checkpointer
-- [ ] Human-in-the-loop interrupts
-- [ ] NuGet publishing
+- [x] Source-generated tool discovery (`[Tool]` attribute → `CreateTools()` at compile time)
+- [x] `Agent<TDeps, TResult>` — compile-time-checked dependency injection into tools
+- [x] Agent-as-node helpers bridging `Trellis` and `Trellis.Graph`
+- [x] Parallel fan-out/fan-in branches
+- [x] `Trellis.Checkpointing.Sqlite` durable checkpointer
+- [x] Human-in-the-loop interrupts
+- [x] NuGet release pipeline (packages publish on version tags)
+- [ ] Streaming agent responses (token-by-token)
+- [ ] OpenTelemetry instrumentation for agents and graph runs
+- [ ] Retry/fallback policies per node
+- [ ] Postgres checkpointer
 
 ## License
 

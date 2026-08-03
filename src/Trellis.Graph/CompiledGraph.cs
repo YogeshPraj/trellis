@@ -31,14 +31,42 @@ public sealed class CompiledGraph<TState>
         string threadId = options?.ThreadId ?? NewThreadId();
         TState finalState = input;
         int steps = 0;
+        GraphEvent<TState>? last = null;
 
         await foreach (GraphEvent<TState> evt in StreamAsync(input, options, threadId, cancellationToken).ConfigureAwait(false))
         {
             finalState = evt.State;
             steps = evt.Step;
+            last = evt;
         }
 
-        return new GraphResult<TState>(finalState, steps, threadId);
+        return last?.Type == GraphEventType.GraphInterrupted
+            ? new GraphResult<TState>(finalState, steps, threadId, GraphRunStatus.Interrupted, last.Node)
+            : new GraphResult<TState>(finalState, steps, threadId);
+    }
+
+    /// <summary>
+    /// Rewrites the latest checkpointed state for a thread — typically to apply human edits
+    /// while a run is paused at an interrupt, before resuming.
+    /// </summary>
+    public async Task UpdateStateAsync(
+        string threadId,
+        Func<TState, TState> update,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(threadId);
+        ArgumentNullException.ThrowIfNull(update);
+        if (_checkpointer is null)
+        {
+            throw new GraphExecutionException("UpdateStateAsync requires the graph to be compiled with a checkpointer.");
+        }
+
+        Checkpoint<TState>? checkpoint = await _checkpointer.LoadAsync(threadId, cancellationToken).ConfigureAwait(false)
+            ?? throw new GraphExecutionException($"No checkpoint exists for thread '{threadId}'.");
+
+        await _checkpointer
+            .SaveAsync(checkpoint with { State = update(checkpoint.State) }, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>
@@ -58,9 +86,23 @@ public sealed class CompiledGraph<TState>
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         int maxSteps = options?.MaxSteps ?? GraphRunOptions.DefaultMaxSteps;
+        IReadOnlyCollection<string>? interruptBefore = options?.InterruptBefore;
         TState state = input;
         string node = _entryPoint;
         int step = 0;
+        bool justResumed = false;
+
+        if (interruptBefore is { Count: > 0 })
+        {
+            if (_checkpointer is null)
+            {
+                throw new GraphExecutionException("InterruptBefore requires the graph to be compiled with a checkpointer.");
+            }
+            if (options?.ThreadId is null)
+            {
+                throw new GraphExecutionException("InterruptBefore requires GraphRunOptions.ThreadId so the run can be resumed.");
+            }
+        }
 
         // Resume from the latest checkpoint when the caller supplied a thread id.
         if (_checkpointer is not null && options?.ThreadId is not null)
@@ -71,12 +113,24 @@ public sealed class CompiledGraph<TState>
                 state = checkpoint.State;
                 node = checkpoint.NextNode;
                 step = checkpoint.Step;
+                justResumed = true;
             }
         }
 
         while (node != StateGraph.End)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
+            // A resumed run must execute the node it paused in front of instead of pausing again.
+            if (!justResumed && interruptBefore?.Contains(node) == true)
+            {
+                await _checkpointer!
+                    .SaveAsync(new Checkpoint<TState>(threadId, step, node, state), cancellationToken)
+                    .ConfigureAwait(false);
+                yield return new GraphEvent<TState>(GraphEventType.GraphInterrupted, node, step, state);
+                yield break;
+            }
+            justResumed = false;
 
             if (step >= maxSteps)
             {

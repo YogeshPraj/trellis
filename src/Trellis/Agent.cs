@@ -54,31 +54,12 @@ public class Agent<TResult>
     }
 
     /// <summary>Runs the agent with a full message history (multi-turn).</summary>
-    public async Task<AgentRunResult<TResult>> RunAsync(
+    public Task<AgentRunResult<TResult>> RunAsync(
         IEnumerable<ChatMessage> messages,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(messages);
-
-        List<ChatMessage> all = [];
-        if (!string.IsNullOrEmpty(_instructions))
-        {
-            all.Add(new ChatMessage(ChatRole.System, _instructions));
-        }
-        all.AddRange(messages);
-
-        if (typeof(TResult) == typeof(string))
-        {
-            ChatResponse response = await _client
-                .GetResponseAsync(all, _chatOptions, cancellationToken)
-                .ConfigureAwait(false);
-            return new AgentRunResult<TResult>((TResult)(object)response.Text, response);
-        }
-
-        ChatResponse<TResult> typed = await _client
-            .GetResponseAsync<TResult>(all, _chatOptions, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-        return new AgentRunResult<TResult>(typed.Result, typed);
+        return AgentRunner.RunAsync<TResult>(_client, _instructions, _chatOptions, messages, cancellationToken);
     }
 }
 

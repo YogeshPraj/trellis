@@ -7,12 +7,15 @@ public sealed class FakeChatClient(string responseText) : IChatClient
 {
     public List<IReadOnlyList<ChatMessage>> Requests { get; } = [];
 
+    public List<ChatOptions?> Options { get; } = [];
+
     public Task<ChatResponse> GetResponseAsync(
         IEnumerable<ChatMessage> messages,
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
         Requests.Add([.. messages]);
+        Options.Add(options);
         return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, responseText)));
     }
 

@@ -23,6 +23,10 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Trellis\Trellis.csproj" />
     <ProjectReference Include="..\..\src\Trellis.Graph\Trellis.Graph.csproj" />
+    <ProjectReference Include="..\..\src\Trellis.Checkpointing.Sqlite\Trellis.Checkpointing.Sqlite.csproj" />
+    <ProjectReference Include="..\..\src\Trellis.Tools.Generator\Trellis.Tools.Generator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

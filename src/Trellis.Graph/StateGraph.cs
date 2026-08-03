@@ -51,6 +51,42 @@ public sealed class StateGraph<TState>
         return AddNode(name, (state, _) => handler(state));
     }
 
+    /// <summary>
+    /// Adds a fan-out/fan-in node: every branch runs concurrently against the same input state,
+    /// then <paramref name="merge"/> combines the input state and all branch results into one state.
+    /// </summary>
+    public StateGraph<TState> AddParallelNode(
+        string name,
+        IReadOnlyList<NodeHandler<TState>> branches,
+        Func<TState, IReadOnlyList<TState>, TState> merge)
+    {
+        ArgumentNullException.ThrowIfNull(branches);
+        ArgumentNullException.ThrowIfNull(merge);
+        if (branches.Count == 0)
+        {
+            throw new GraphDefinitionException($"Parallel node '{name}' needs at least one branch.");
+        }
+
+        return AddNode(name, async (state, ct) =>
+        {
+            TState[] results = await Task.WhenAll(branches.Select(b => b(state, ct))).ConfigureAwait(false);
+            return merge(state, results);
+        });
+    }
+
+    /// <summary>Adds a fan-out/fan-in node whose branches do not need a cancellation token.</summary>
+    public StateGraph<TState> AddParallelNode(
+        string name,
+        IReadOnlyList<Func<TState, Task<TState>>> branches,
+        Func<TState, IReadOnlyList<TState>, TState> merge)
+    {
+        ArgumentNullException.ThrowIfNull(branches);
+        return AddParallelNode(
+            name,
+            [.. branches.Select(b => new NodeHandler<TState>((state, _) => b(state)))],
+            merge);
+    }
+
     /// <summary>Adds a fixed edge: after <paramref name="from"/> completes, run <paramref name="to"/>.</summary>
     public StateGraph<TState> AddEdge(string from, string to)
     {

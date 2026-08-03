@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Description>Graph workflow runtime for .NET — state-machine orchestration with conditional routing, parallel fan-out/fan-in, streaming execution events, checkpointing with resume, and human-in-the-loop interrupts. No AI dependency.</Description>
   </PropertyGroup>
 
 </Project>
