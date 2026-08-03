@@ -1,0 +1,14 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>Priority-based model failover for any IChatClient — circuit-breaker cooldowns on rate limits and quota exhaustion, automatic recovery, round-robin load sharing, and streaming-aware failover. Route across multiple model deployments with zero per-request friction.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.8.3" />
+  </ItemGroup>
+
+</Project>

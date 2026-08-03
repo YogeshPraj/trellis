@@ -18,6 +18,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🔀 **Parallel fan-out/fan-in** — `AddParallelNode(...)` runs branches concurrently against the same state and merges the results.
 - ✋ **Human-in-the-loop interrupts** — pause a run in front of any node (`InterruptBefore`), let a human review or edit the state, then resume from the same thread id.
 - 🗄️ **Durable SQLite checkpointing** — `Trellis.Checkpointing.Sqlite` persists progress to a database file; workflows survive crashes and process restarts.
+- 🚦 **Model failover & prioritization** — `ModelRouter` spreads requests across multiple deployments by priority. A model that hits a rate limit or runs out of quota is tripped with an exponential cooldown and *skipped entirely* until it recovers — later requests go straight to the fallback with zero added latency.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
 - 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
@@ -124,6 +125,39 @@ await graph.UpdateStateAsync("wf-1", s => s with { Draft = editedDraft });
 var done = await graph.RunAsync(initialState, options);            // resumes → Completed
 ```
 
+## Model failover & prioritization
+
+Running multiple deployments (Azure + OpenAI + a local Ollama, or the same model in several regions)? `ModelRouter` is an `IChatClient`, so it drops underneath any agent or graph unchanged — and it solves the "one model ran out of tokens" problem without adding latency to every request:
+
+```csharp
+using Trellis.Routing;
+
+IChatClient router = new ModelRouter(
+[
+    new ModelEndpoint("azure-eastus", azureClient,  priority: 0),  // preferred
+    new ModelEndpoint("azure-west",   azureClient2, priority: 0),  // same tier → round-robin
+    new ModelEndpoint("openai",       openaiClient, priority: 1),  // fallback
+    new ModelEndpoint("ollama-local", ollamaClient, priority: 2),  // last resort
+],
+new ModelRouterOptions
+{
+    BaseCooldown = TimeSpan.FromSeconds(30),   // doubles per consecutive failure, capped at MaxCooldown
+    OnEndpointTripped = (e, ex, until) => logger.LogWarning("{Name} tripped until {Until}", e.Name, until),
+    OnEndpointRecovered = e => logger.LogInformation("{Name} recovered", e.Name),
+});
+
+var agent = new Agent<FlightResult>(router, instructions: "You book flights.");
+```
+
+How it behaves when a deployment hits a 429 / quota exhaustion / outage:
+
+1. The failing request pays the failover cost **once** and is answered by the next tier.
+2. The failed endpoint is **tripped** — subsequent requests skip it entirely (no probe, no wait, no friction) while its cooldown runs.
+3. Repeated failures double the cooldown (30s → 60s → 120s → ... up to `MaxCooldown`).
+4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
+
+Errors that would fail on *every* model (e.g. malformed requests) propagate immediately instead of cascading through your deployments — the classifier is pluggable via `ShouldTrip`. If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
 ## Packages
 
 | Package | What's in it |
@@ -131,6 +165,7 @@ var done = await graph.RunAsync(initialState, options);            // resumes �
 | `Trellis` | Typed agents (`Agent<TResult>`, `Agent<TDeps, TResult>`), the `[Tool]` source generator, and agent-as-node graph helpers |
 | `Trellis.Graph` | Graph runtime: `StateGraph<TState>`, parallel branches, streaming, interrupts, checkpointing (no AI dependency — usable for any workflow) |
 | `Trellis.Checkpointing.Sqlite` | Durable SQLite-backed checkpointer for graph workflows |
+| `Trellis.Routing` | `ModelRouter`: priority-based failover across model deployments with circuit-breaker cooldowns and automatic recovery |
 
 ## Building
 
@@ -149,6 +184,7 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 - [x] `Trellis.Checkpointing.Sqlite` durable checkpointer
 - [x] Human-in-the-loop interrupts
 - [x] NuGet release pipeline (packages publish on version tags)
+- [x] Model failover & prioritization (`Trellis.Routing`)
 - [ ] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node
