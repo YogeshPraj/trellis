@@ -1,10 +1,18 @@
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 
 namespace Trellis.Graph;
 
 /// <summary>An executable graph produced by <see cref="StateGraph{TState}.Compile"/>.</summary>
+/// <remarks>
+/// Concurrent runs on the same thread id would interleave checkpoints and corrupt the
+/// workflow, so this graph rejects them within the process. ⚠ The guard is per-process:
+/// in a multi-instance deployment, route a given thread id to one instance (or otherwise
+/// ensure single-writer semantics) — cross-instance leasing is not provided yet.
+/// </remarks>
 public sealed class CompiledGraph<TState>
 {
+    private readonly ConcurrentDictionary<string, byte> _activeThreads = new();
     private readonly IReadOnlyDictionary<string, NodeHandler<TState>> _nodes;
     private readonly IReadOnlyDictionary<string, Func<TState, string>> _routers;
     private readonly string _entryPoint;
@@ -80,6 +88,35 @@ public sealed class CompiledGraph<TState>
         StreamAsync(input, options, options?.ThreadId ?? NewThreadId(), cancellationToken);
 
     private async IAsyncEnumerable<GraphEvent<TState>> StreamAsync(
+        TState input,
+        GraphRunOptions? options,
+        string threadId,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        // A second concurrent run on the same thread id would interleave checkpoints.
+        bool guarded = options?.ThreadId is not null;
+        if (guarded && !_activeThreads.TryAdd(threadId, 0))
+        {
+            throw new GraphExecutionException(
+                $"Thread '{threadId}' is already running on this graph. Await the active run before starting another.");
+        }
+        try
+        {
+            await foreach (GraphEvent<TState> evt in StreamCoreAsync(input, options, threadId, cancellationToken).ConfigureAwait(false))
+            {
+                yield return evt;
+            }
+        }
+        finally
+        {
+            if (guarded)
+            {
+                _activeThreads.TryRemove(threadId, out _);
+            }
+        }
+    }
+
+    private async IAsyncEnumerable<GraphEvent<TState>> StreamCoreAsync(
         TState input,
         GraphRunOptions? options,
         string threadId,

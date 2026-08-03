@@ -59,11 +59,18 @@ public interface IFailurePolicy
 
 /// <summary>
 /// Default classifier: uses typed information (HTTP status codes, timeout exception types)
-/// first, then falls back to message heuristics. Subclass and override
-/// <see cref="ExtractRetryAfter"/> or wrap it to add provider-specific knowledge.
+/// first, then falls back to message heuristics. Numeric status codes in messages must
+/// appear as standalone tokens ("HTTP 500", "status: 429") — "took 500ms" or "id 14290"
+/// never trips an endpoint. Subclass and override <see cref="ExtractRetryAfter"/> or wrap
+/// it to add provider-specific knowledge.
 /// </summary>
-public class DefaultFailureClassifier : IFailureClassifier
+public partial class DefaultFailureClassifier : IFailureClassifier
 {
+    [System.Text.RegularExpressions.GeneratedRegex(@"(?<![\w.])(429)(?![\w.])")]
+    private static partial System.Text.RegularExpressions.Regex RateLimitStatusPattern();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"(?<![\w.])(500|502|503|504)(?![\w.])")]
+    private static partial System.Text.RegularExpressions.Regex ServerErrorStatusPattern();
     public FailureClassification Classify(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
@@ -125,7 +132,7 @@ public class DefaultFailureClassifier : IFailureClassifier
         {
             return FailureKind.QuotaExhausted;
         }
-        if (Has("429") || Has("rate limit") || Has("ratelimit") || Has("too many requests"))
+        if (RateLimitStatusPattern().IsMatch(text) || Has("rate limit") || Has("ratelimit") || Has("too many requests"))
         {
             return FailureKind.RateLimit;
         }
@@ -133,7 +140,7 @@ public class DefaultFailureClassifier : IFailureClassifier
         {
             return FailureKind.Timeout;
         }
-        if (Has("500") || Has("502") || Has("503") || Has("overloaded") || Has("unavailable") || Has("server error"))
+        if (ServerErrorStatusPattern().IsMatch(text) || Has("overloaded") || Has("unavailable") || Has("server error"))
         {
             return FailureKind.ServerError;
         }

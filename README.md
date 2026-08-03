@@ -271,6 +271,12 @@ dotnet test
 
 Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests run against a fake `IChatClient`.
 
+## Validation status (honest edition)
+
+- ✅ **Validated against a real model** (local Ollama, `qwen2.5:1.5b`): plain agent runs, **typed structured outputs**, **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
+- ⚠️ **Not yet validated against a live provider**: the Responses-API conversation sync (`ModelFeatures.ServerConversationState`) is tested against fakes only — its assumptions about provider `ConversationId` semantics have not been exercised against the real OpenAI Responses API. Treat it as experimental until then.
+- ⚠️ **Multi-instance notes**: router health state and conversation archives are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only); the live `Conversation` object and graph run-guard are per-process — use session affinity or persist/rehydrate conversations across instances.
+
 ## Roadmap
 
 - [x] Source-generated tool discovery (`[Tool]` attribute → `CreateTools()` at compile time)

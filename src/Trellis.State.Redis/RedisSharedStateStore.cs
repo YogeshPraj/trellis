@@ -44,4 +44,26 @@ public sealed class RedisSharedStateStore : ISharedStateStore
         ArgumentException.ThrowIfNullOrEmpty(key);
         await _database.KeyDeleteAsync(_keyPrefix + key).ConfigureAwait(false);
     }
+
+    /// <summary>Atomic across all instances (Redis INCR).</summary>
+    public async ValueTask<long> IncrementAsync(string key, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        return await _database.StringIncrementAsync(_keyPrefix + key).ConfigureAwait(false);
+    }
+
+    /// <summary>Atomic across all instances (Redis RPUSH).</summary>
+    public async ValueTask<long> AppendAsync(string key, string value, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        ArgumentNullException.ThrowIfNull(value);
+        return await _database.ListRightPushAsync(_keyPrefix + key, value).ConfigureAwait(false);
+    }
+
+    public async ValueTask<IReadOnlyList<string>> GetListAsync(string key, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        RedisValue[] values = await _database.ListRangeAsync(_keyPrefix + key).ConfigureAwait(false);
+        return [.. values.Select(v => v.ToString())];
+    }
 }

@@ -19,9 +19,14 @@ jobs:
       - name: Pack
         run: dotnet pack --configuration Release --output packages
       - name: Push to NuGet
+        # Skipped (not failed) when the NUGET_API_KEY secret isn't configured, so the
+        # GitHub release below is still produced.
+        if: env.NUGET_API_KEY != ''
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: >
           dotnet nuget push "packages/*.nupkg"
-          --api-key "${{ secrets.NUGET_API_KEY }}"
+          --api-key "$NUGET_API_KEY"
           --source https://api.nuget.org/v3/index.json
           --skip-duplicates
       - name: Create GitHub release

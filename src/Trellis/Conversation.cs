@@ -9,6 +9,11 @@ namespace Trellis;
 /// conversation-aware router can exploit provider-side context features per endpoint
 /// while failover always has the full history to replay.
 /// </summary>
+/// <remarks>
+/// Not thread-safe: run one turn at a time per conversation. In multi-instance
+/// deployments this object lives in one process's memory — persist and rehydrate it
+/// (or use session affinity) if consecutive turns can land on different instances.
+/// </remarks>
 public sealed class Conversation
 {
     private readonly List<ChatMessage> _messages = [];
@@ -51,6 +56,13 @@ public sealed class Conversation
         ArgumentNullException.ThrowIfNull(messages);
         _messages.AddRange(messages);
     }
+
+    /// <summary>
+    /// Compaction kicked off after the previous turn completed (kept off the response path);
+    /// the next turn awaits it before building its payload. Await this before persisting
+    /// the conversation or shutting down, so an in-flight compaction isn't lost.
+    /// </summary>
+    public Task? PendingCompaction { get; internal set; }
 
     internal void ApplyCompaction(int evictCount, string summary)
     {

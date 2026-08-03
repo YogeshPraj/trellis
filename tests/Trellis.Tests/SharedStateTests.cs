@@ -31,6 +31,28 @@ public class InMemorySharedStateStoreTests
     }
 
     [Fact]
+    public async Task ConcurrentAppends_LoseNothing()
+    {
+        var store = new InMemorySharedStateStore();
+
+        await Task.WhenAll(Enumerable.Range(0, 200).Select(i =>
+            Task.Run(() => store.AppendAsync("list", $"item-{i}").AsTask())));
+
+        Assert.Equal(200, (await store.GetListAsync("list")).Count);
+    }
+
+    [Fact]
+    public async Task ConcurrentIncrements_LoseNothing()
+    {
+        var store = new InMemorySharedStateStore();
+
+        await Task.WhenAll(Enumerable.Range(0, 200).Select(_ =>
+            Task.Run(() => store.IncrementAsync("counter").AsTask())));
+
+        Assert.Equal("200", await store.GetAsync("counter"));
+    }
+
+    [Fact]
     public async Task Entry_ExpiresAfterTtl()
     {
         var time = new FakeTime();
@@ -153,12 +175,18 @@ public class SharedHealthStoreFleetTests
     public async Task HealthRoundTrips_ThroughSharedStateStore()
     {
         var store = new SharedStateEndpointHealthStore(new InMemorySharedStateStore());
-        var health = new EndpointHealth(3, new DateTimeOffset(2026, 1, 1, 0, 5, 0, TimeSpan.Zero), true);
+        var until = new DateTimeOffset(2026, 1, 1, 0, 5, 0, TimeSpan.Zero);
 
-        await store.SetAsync("primary", health);
+        Assert.Equal(1, await store.RecordFailureAsync("primary"));
+        Assert.Equal(2, await store.RecordFailureAsync("primary"));
+        Assert.Equal(3, await store.RecordFailureAsync("primary"));
+        await store.SetCooldownAsync("primary", until);
 
-        Assert.Equal(health, await store.GetAsync("primary"));
+        Assert.Equal(new EndpointHealth(3, until, true), await store.GetAsync("primary"));
         Assert.Equal(EndpointHealth.Healthy, await store.GetAsync("never-seen"));
+
+        await store.ResetAsync("primary");
+        Assert.Equal(EndpointHealth.Healthy, await store.GetAsync("primary"));
     }
 
     [Fact]

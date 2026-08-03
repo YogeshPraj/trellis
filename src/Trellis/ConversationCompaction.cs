@@ -13,6 +13,13 @@ public sealed class CompactionOptions
 
     /// <summary>How many recent messages stay hot (verbatim) after a compaction.</summary>
     public int KeepRecentMessages { get; set; } = 12;
+
+    /// <summary>
+    /// Called when a compaction attempt fails (summarizer or archive error). Compaction
+    /// failures never fail the user's turn — the turn proceeds uncompacted and compaction
+    /// is retried on a later turn. Use this hook for logging/alerting.
+    /// </summary>
+    public Action<Exception>? OnCompactionFailure { get; set; }
 }
 
 /// <summary>
@@ -125,7 +132,10 @@ public sealed class InMemoryConversationArchive : IConversationArchive
 
 /// <summary>
 /// Archive provider over any <see cref="ISharedStateStore"/> (Redis, IDistributedCache, ...),
-/// so cold context survives restarts and is shared across app instances.
+/// so cold context survives restarts and is shared across app instances. Each message is
+/// appended individually via the store's <see cref="ISharedStateStore.AppendAsync"/>, so with
+/// an atomic provider (Redis) concurrent archivers cannot lose messages. With the
+/// IDistributedCache bridge, appends are read-modify-write — see that provider's atomicity note.
 /// </summary>
 public sealed class SharedStateConversationArchive : IConversationArchive
 {
@@ -147,10 +157,11 @@ public sealed class SharedStateConversationArchive : IConversationArchive
     {
         ArgumentException.ThrowIfNullOrEmpty(conversationId);
         ArgumentNullException.ThrowIfNull(messages);
-        IReadOnlyList<ChatMessage> existing = await LoadAsync(conversationId, cancellationToken).ConfigureAwait(false);
-        List<ChatMessage> all = [.. existing, .. messages];
-        string json = JsonSerializer.Serialize(all, AIJsonUtilities.DefaultOptions);
-        await _store.SetAsync(_keyPrefix + conversationId, json, null, cancellationToken).ConfigureAwait(false);
+        foreach (ChatMessage message in messages)
+        {
+            string json = JsonSerializer.Serialize(message, AIJsonUtilities.DefaultOptions);
+            await _store.AppendAsync(_keyPrefix + conversationId, json, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async ValueTask<IReadOnlyList<ChatMessage>> LoadAsync(
@@ -158,10 +169,18 @@ public sealed class SharedStateConversationArchive : IConversationArchive
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(conversationId);
-        string? json = await _store.GetAsync(_keyPrefix + conversationId, cancellationToken).ConfigureAwait(false);
-        return json is null
-            ? []
-            : JsonSerializer.Deserialize<List<ChatMessage>>(json, AIJsonUtilities.DefaultOptions) ?? [];
+        IReadOnlyList<string> entries = await _store
+            .GetListAsync(_keyPrefix + conversationId, cancellationToken)
+            .ConfigureAwait(false);
+        List<ChatMessage> messages = new(entries.Count);
+        foreach (string json in entries)
+        {
+            if (JsonSerializer.Deserialize<ChatMessage>(json, AIJsonUtilities.DefaultOptions) is ChatMessage message)
+            {
+                messages.Add(message);
+            }
+        }
+        return messages;
     }
 }
 
@@ -174,9 +193,10 @@ public sealed class SharedStateConversationArchive : IConversationArchive
 /// so conversation-aware routers replay full history instead of an invalid delta.
 /// </summary>
 /// <remarks>
-/// Eviction is message-count based and does not inspect tool-call chains; if you use tools
-/// heavily inside conversations, size <see cref="CompactionOptions.KeepRecentMessages"/>
-/// generously so a call/result pair is unlikely to straddle the boundary.
+/// The eviction boundary is adjusted so a tool call/result chain is never split: if the
+/// first message that would stay hot is a tool result, the boundary advances past the whole
+/// chain (providers reject histories that start with an orphaned tool result). Compaction
+/// failures are swallowed by design — see <see cref="CompactionOptions.OnCompactionFailure"/>.
 /// </remarks>
 public sealed class ConversationCompactor
 {
@@ -200,7 +220,12 @@ public sealed class ConversationCompactor
         }
     }
 
-    /// <summary>Compacts when the hot history is over budget. Returns true when a compaction ran.</summary>
+    /// <summary>
+    /// Compacts when the hot history is over budget. Returns true when a compaction ran.
+    /// Never throws for summarizer/archive failures — the conversation is left untouched
+    /// and <see cref="CompactionOptions.OnCompactionFailure"/> is invoked instead, so an
+    /// internal optimization failure can never fail a user's turn.
+    /// </summary>
     public async Task<bool> CompactIfNeededAsync(Conversation conversation, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(conversation);
@@ -209,18 +234,46 @@ public sealed class ConversationCompactor
             return false;
         }
 
-        int evictCount = conversation.Messages.Count - _options.KeepRecentMessages;
+        int evictCount = AdjustBoundaryPastToolChains(conversation.Messages, conversation.Messages.Count - _options.KeepRecentMessages);
+        if (evictCount <= 0 || evictCount >= conversation.Messages.Count)
+        {
+            return false;
+        }
         List<ChatMessage> evicted = [.. conversation.Messages.Take(evictCount)];
 
-        string summary = await _summarizer
-            .SummarizeAsync(conversation.Summary, evicted, cancellationToken)
-            .ConfigureAwait(false);
-        if (_archive is not null)
+        string summary;
+        try
         {
-            await _archive.ArchiveAsync(conversation.Id, evicted, cancellationToken).ConfigureAwait(false);
+            summary = await _summarizer
+                .SummarizeAsync(conversation.Summary, evicted, cancellationToken)
+                .ConfigureAwait(false);
+            if (_archive is not null)
+            {
+                await _archive.ArchiveAsync(conversation.Id, evicted, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _options.OnCompactionFailure?.Invoke(ex);
+            return false;
         }
 
         conversation.ApplyCompaction(evictCount, summary);
         return true;
+    }
+
+    /// <summary>
+    /// Advances the eviction boundary while the first message that would remain hot is a
+    /// tool result, so a call/result chain is evicted (and summarized) as a unit instead
+    /// of leaving an orphaned tool result that providers reject.
+    /// </summary>
+    private static int AdjustBoundaryPastToolChains(IReadOnlyList<ChatMessage> messages, int boundary)
+    {
+        while (boundary < messages.Count
+            && messages[boundary].Contents.Any(c => c is FunctionResultContent))
+        {
+            boundary++;
+        }
+        return boundary;
     }
 }

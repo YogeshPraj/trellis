@@ -247,11 +247,14 @@ public sealed class ModelRouter : IChatClient
         Exception cause,
         CancellationToken cancellationToken)
     {
-        int failures = candidate.Health.ConsecutiveFailures + 1;
+        // Atomic increment: concurrent failures across instances never lose backoff escalation.
+        int failures = await _options.HealthStore
+            .RecordFailureAsync(candidate.Endpoint.Name, cancellationToken)
+            .ConfigureAwait(false);
         TimeSpan cooldown = classification.RetryAfter ?? ExponentialCooldown(failures);
         DateTimeOffset until = _time.GetUtcNow() + cooldown;
         await _options.HealthStore
-            .SetAsync(candidate.Endpoint.Name, new EndpointHealth(failures, until, Tripped: true), cancellationToken)
+            .SetCooldownAsync(candidate.Endpoint.Name, until, cancellationToken)
             .ConfigureAwait(false);
         _options.OnEndpointTripped?.Invoke(candidate.Endpoint, cause, until);
     }
@@ -263,7 +266,7 @@ public sealed class ModelRouter : IChatClient
             return;
         }
         await _options.HealthStore
-            .SetAsync(candidate.Endpoint.Name, EndpointHealth.Healthy, cancellationToken)
+            .ResetAsync(candidate.Endpoint.Name, cancellationToken)
             .ConfigureAwait(false);
         if (candidate.Health.Tripped)
         {

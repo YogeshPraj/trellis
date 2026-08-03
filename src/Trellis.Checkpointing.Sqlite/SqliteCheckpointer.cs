@@ -15,24 +15,41 @@ public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
 
     private readonly string _connectionString;
     private readonly JsonSerializerOptions? _jsonOptions;
+    private readonly int? _maxCheckpointsPerThread;
     private volatile bool _initialized;
 
     /// <param name="connectionString">A Microsoft.Data.Sqlite connection string, e.g. <c>Data Source=checkpoints.db</c>.</param>
     /// <param name="jsonOptions">Optional serializer options for the state payload.</param>
-    public SqliteCheckpointer(string connectionString, JsonSerializerOptions? jsonOptions = null)
+    /// <param name="maxCheckpointsPerThread">
+    /// Retention: after each save, checkpoints beyond the newest N for that thread are
+    /// pruned so the database doesn't grow forever. Default 100; null disables pruning.
+    /// </param>
+    public SqliteCheckpointer(
+        string connectionString,
+        JsonSerializerOptions? jsonOptions = null,
+        int? maxCheckpointsPerThread = 100)
     {
         ArgumentException.ThrowIfNullOrEmpty(connectionString);
+        if (maxCheckpointsPerThread is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxCheckpointsPerThread));
+        }
         _connectionString = connectionString;
         _jsonOptions = jsonOptions;
+        _maxCheckpointsPerThread = maxCheckpointsPerThread;
     }
 
     /// <summary>Creates a checkpointer storing its database at <paramref name="filePath"/>.</summary>
-    public static SqliteCheckpointer<TState> FromFile(string filePath, JsonSerializerOptions? jsonOptions = null)
+    public static SqliteCheckpointer<TState> FromFile(
+        string filePath,
+        JsonSerializerOptions? jsonOptions = null,
+        int? maxCheckpointsPerThread = 100)
     {
         ArgumentException.ThrowIfNullOrEmpty(filePath);
         return new SqliteCheckpointer<TState>(
             new SqliteConnectionStringBuilder { DataSource = filePath }.ToString(),
-            jsonOptions);
+            jsonOptions,
+            maxCheckpointsPerThread);
     }
 
     public async Task SaveAsync(Checkpoint<TState> checkpoint, CancellationToken cancellationToken = default)
@@ -48,6 +65,19 @@ public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
         command.Parameters.AddWithValue("$next", checkpoint.NextNode);
         command.Parameters.AddWithValue("$state", JsonSerializer.Serialize(checkpoint.State, _jsonOptions));
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+        if (_maxCheckpointsPerThread is int keep)
+        {
+            SqliteCommand prune = connection.CreateCommand();
+            prune.CommandText =
+                $"""
+                 DELETE FROM {TableName} WHERE thread_id = $thread AND id NOT IN
+                     (SELECT id FROM {TableName} WHERE thread_id = $thread ORDER BY id DESC LIMIT $keep)
+                 """;
+            prune.Parameters.AddWithValue("$thread", checkpoint.ThreadId);
+            prune.Parameters.AddWithValue("$keep", keep);
+            await prune.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     public async Task<Checkpoint<TState>?> LoadAsync(string threadId, CancellationToken cancellationToken = default)
@@ -101,11 +131,18 @@ public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
+        // busy_timeout is per-connection: concurrent writers wait instead of failing
+        // immediately with SQLITE_BUSY.
+        SqliteCommand busy = connection.CreateCommand();
+        busy.CommandText = "PRAGMA busy_timeout = 5000;";
+        await busy.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
         if (!_initialized)
         {
             SqliteCommand create = connection.CreateCommand();
             create.CommandText =
                 $"""
+                 PRAGMA journal_mode = WAL;
                  CREATE TABLE IF NOT EXISTS {TableName} (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      thread_id TEXT NOT NULL,

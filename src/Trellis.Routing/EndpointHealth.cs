@@ -12,33 +12,76 @@ public sealed record EndpointHealth(int ConsecutiveFailures, DateTimeOffset Unav
 }
 
 /// <summary>
-/// Persists endpoint health (Repository). The default is per-process; implement this over
-/// Redis or a database to share cooldown state across app instances, so one instance
-/// tripping a dead deployment protects the whole fleet.
+/// Persists endpoint health (Repository). Failure counting is expressed as an atomic
+/// operation (<see cref="RecordFailureAsync"/>) rather than read-modify-write, so
+/// concurrent failures across app instances cannot lose backoff escalation. Implement over
+/// a shared backend so one instance tripping a dead deployment protects the whole fleet.
 /// </summary>
 public interface IEndpointHealthStore
 {
     ValueTask<EndpointHealth> GetAsync(string endpointName, CancellationToken cancellationToken = default);
 
-    ValueTask SetAsync(string endpointName, EndpointHealth health, CancellationToken cancellationToken = default);
+    /// <summary>Atomically records a failure and returns the new consecutive-failure count.</summary>
+    ValueTask<int> RecordFailureAsync(string endpointName, CancellationToken cancellationToken = default);
+
+    /// <summary>Marks the endpoint out of rotation until <paramref name="until"/> (last-writer-wins is acceptable).</summary>
+    ValueTask SetCooldownAsync(string endpointName, DateTimeOffset until, CancellationToken cancellationToken = default);
+
+    /// <summary>Restores the endpoint to healthy after a successful call.</summary>
+    ValueTask ResetAsync(string endpointName, CancellationToken cancellationToken = default);
 }
 
 /// <summary>In-process health store. Suitable for single-instance apps and tests.</summary>
 public sealed class InMemoryEndpointHealthStore : IEndpointHealthStore
 {
-    private readonly ConcurrentDictionary<string, EndpointHealth> _health = new();
+    private sealed class Entry
+    {
+        public int ConsecutiveFailures;
+        public DateTimeOffset UnavailableUntil = DateTimeOffset.MinValue;
+        public bool Tripped;
+    }
+
+    private readonly ConcurrentDictionary<string, Entry> _health = new();
 
     public ValueTask<EndpointHealth> GetAsync(string endpointName, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
-        return ValueTask.FromResult(_health.GetValueOrDefault(endpointName, EndpointHealth.Healthy));
+        if (_health.TryGetValue(endpointName, out Entry? entry))
+        {
+            lock (entry)
+            {
+                return ValueTask.FromResult(new EndpointHealth(entry.ConsecutiveFailures, entry.UnavailableUntil, entry.Tripped));
+            }
+        }
+        return ValueTask.FromResult(EndpointHealth.Healthy);
     }
 
-    public ValueTask SetAsync(string endpointName, EndpointHealth health, CancellationToken cancellationToken = default)
+    public ValueTask<int> RecordFailureAsync(string endpointName, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(endpointName);
-        ArgumentNullException.ThrowIfNull(health);
-        _health[endpointName] = health;
+        Entry entry = _health.GetOrAdd(endpointName, _ => new Entry());
+        lock (entry)
+        {
+            return ValueTask.FromResult(++entry.ConsecutiveFailures);
+        }
+    }
+
+    public ValueTask SetCooldownAsync(string endpointName, DateTimeOffset until, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(endpointName);
+        Entry entry = _health.GetOrAdd(endpointName, _ => new Entry());
+        lock (entry)
+        {
+            entry.UnavailableUntil = until;
+            entry.Tripped = true;
+        }
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask ResetAsync(string endpointName, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(endpointName);
+        _health.TryRemove(endpointName, out _);
         return ValueTask.CompletedTask;
     }
 }

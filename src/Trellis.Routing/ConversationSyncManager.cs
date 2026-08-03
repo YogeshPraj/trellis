@@ -11,7 +11,18 @@ namespace Trellis.Routing;
 /// </summary>
 internal sealed class ConversationSyncManager
 {
-    private readonly ConcurrentDictionary<string, (string ProviderId, int SyncedCount)> _sync = new();
+    private sealed record SyncEntry(string ProviderId, int SyncedCount)
+    {
+        public long TouchedAt { get; set; } = Environment.TickCount64;
+    }
+
+    // Bounded: least-recently-touched entries are evicted past this size, so a long-lived
+    // process serving many conversations cannot leak sync bookkeeping. Evicting an entry
+    // only costs one full-history resend on that conversation's next request.
+    private const int MaxEntries = 1024;
+
+    private readonly ConcurrentDictionary<string, SyncEntry> _sync = new();
+    private readonly Lock _evictionLock = new();
 
     /// <summary>
     /// Shapes the outgoing request for an endpoint. Streaming calls always replay full
@@ -44,9 +55,9 @@ internal sealed class ConversationSyncManager
             return (full, stripped);
         }
 
-        if (_sync.TryGetValue(key, out (string ProviderId, int SyncedCount) sync)
-            && sync.SyncedCount <= full.Count)
+        if (_sync.TryGetValue(key, out SyncEntry? sync) && sync.SyncedCount <= full.Count)
         {
+            sync.TouchedAt = Environment.TickCount64;
             ChatOptions delta = options.Clone();
             delta.ConversationId = sync.ProviderId;
             return ([.. full.Skip(sync.SyncedCount)], delta);
@@ -67,7 +78,32 @@ internal sealed class ConversationSyncManager
             return;
         }
         // The server now knows the full input plus the messages it just generated.
-        _sync[Key(logicalId, endpoint.Name)] = (providerId, full.Count + response.Messages.Count);
+        _sync[Key(logicalId, endpoint.Name)] = new SyncEntry(providerId, full.Count + response.Messages.Count);
+        EvictIfOverCapacity();
+    }
+
+    private void EvictIfOverCapacity()
+    {
+        if (_sync.Count <= MaxEntries)
+        {
+            return;
+        }
+        lock (_evictionLock)
+        {
+            int excess = _sync.Count - MaxEntries + (MaxEntries / 10);
+            if (excess <= 0)
+            {
+                return;
+            }
+            foreach (string key in _sync
+                .OrderBy(kv => kv.Value.TouchedAt)
+                .Take(excess)
+                .Select(kv => kv.Key)
+                .ToList())
+            {
+                _sync.TryRemove(key, out _);
+            }
+        }
     }
 
     private static string Key(string logicalId, string endpointName) => logicalId + "|" + endpointName;

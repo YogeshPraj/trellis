@@ -83,9 +83,12 @@ public class Agent<TResult>
         ArgumentNullException.ThrowIfNull(conversation);
         ArgumentNullException.ThrowIfNull(prompt);
 
-        if (_compactor is not null)
+        // Compaction runs in the background after a turn completes; catch up on it here so
+        // the summarizer's latency lands between turns, not on the user's response path.
+        if (conversation.PendingCompaction is Task pending)
         {
-            await _compactor.CompactIfNeededAsync(conversation, cancellationToken).ConfigureAwait(false);
+            await pending.ConfigureAwait(false);
+            conversation.PendingCompaction = null;
         }
         conversation.Add(new ChatMessage(ChatRole.User, prompt));
 
@@ -105,6 +108,13 @@ public class Agent<TResult>
             .RunAsync<TResult>(_client, _instructions, options, payload, cancellationToken)
             .ConfigureAwait(false);
         conversation.AddRange(result.Response.Messages);
+
+        // Kick off compaction for the NEXT turn without blocking this one. CompactIfNeededAsync
+        // never throws (failures invoke OnCompactionFailure), so the pending task is safe to await.
+        if (_compactor is not null)
+        {
+            conversation.PendingCompaction = _compactor.CompactIfNeededAsync(conversation, CancellationToken.None);
+        }
         return result;
     }
 }
