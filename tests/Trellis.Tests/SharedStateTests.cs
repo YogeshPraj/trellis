@@ -1,0 +1,197 @@
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Options;
+using NSubstitute;
+using StackExchange.Redis;
+using Trellis.Routing;
+using Trellis.State;
+using Trellis.State.Redis;
+
+namespace Trellis.Tests;
+
+public class InMemorySharedStateStoreTests
+{
+    private sealed class FakeTime : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    [Fact]
+    public async Task SetGetRemove_RoundTrips()
+    {
+        var store = new InMemorySharedStateStore();
+
+        await store.SetAsync("k", "v");
+        Assert.Equal("v", await store.GetAsync("k"));
+
+        await store.RemoveAsync("k");
+        Assert.Null(await store.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task Entry_ExpiresAfterTtl()
+    {
+        var time = new FakeTime();
+        var store = new InMemorySharedStateStore(time);
+
+        await store.SetAsync("k", "v", TimeSpan.FromSeconds(30));
+        Assert.Equal("v", await store.GetAsync("k"));
+
+        time.Now += TimeSpan.FromSeconds(31);
+        Assert.Null(await store.GetAsync("k"));
+    }
+}
+
+public class DistributedCacheBridgeTests
+{
+    private static DistributedCacheSharedStateStore NewStore() =>
+        new(new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions())));
+
+    [Fact]
+    public async Task BridgesAnyIDistributedCache()
+    {
+        DistributedCacheSharedStateStore store = NewStore();
+
+        await store.SetAsync("k", "v");
+        Assert.Equal("v", await store.GetAsync("k"));
+
+        await store.RemoveAsync("k");
+        Assert.Null(await store.GetAsync("k"));
+    }
+}
+
+public class RedisSharedStateStoreTests
+{
+    private static (RedisSharedStateStore Store, IDatabase Db) NewStore()
+    {
+        IConnectionMultiplexer connection = Substitute.For<IConnectionMultiplexer>();
+        IDatabase db = Substitute.For<IDatabase>();
+        connection.GetDatabase(Arg.Any<int>(), Arg.Any<object?>()).Returns(db);
+        return (new RedisSharedStateStore(connection, keyPrefix: "trellis:"), db);
+    }
+
+    [Fact]
+    public async Task Get_ReadsPrefixedKey_AndMapsNullToNull()
+    {
+        (RedisSharedStateStore store, IDatabase db) = NewStore();
+        db.StringGetAsync("trellis:health:primary", Arg.Any<CommandFlags>())
+            .Returns(Task.FromResult((RedisValue)"json-blob"));
+        db.StringGetAsync("trellis:missing", Arg.Any<CommandFlags>())
+            .Returns(Task.FromResult(RedisValue.Null));
+
+        Assert.Equal("json-blob", await store.GetAsync("health:primary"));
+        Assert.Null(await store.GetAsync("missing"));
+    }
+
+    [Fact]
+    public async Task Set_WritesPrefixedKey_WithTtl()
+    {
+        (RedisSharedStateStore store, IDatabase db) = NewStore();
+
+        await store.SetAsync("health:primary", "json-blob", TimeSpan.FromMinutes(20));
+
+        await db.Received(1).StringSetAsync(
+            (RedisKey)"trellis:health:primary",
+            (RedisValue)"json-blob",
+            (Expiration)TimeSpan.FromMinutes(20));
+    }
+
+    [Fact]
+    public async Task Remove_DeletesPrefixedKey()
+    {
+        (RedisSharedStateStore store, IDatabase db) = NewStore();
+
+        await store.RemoveAsync("health:primary");
+
+        await db.Received(1).KeyDeleteAsync((RedisKey)"trellis:health:primary", Arg.Any<CommandFlags>());
+    }
+}
+
+public class SharedHealthStoreFleetTests
+{
+    private sealed class FakeTime : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    private sealed class ScriptedClient(string name) : IChatClient
+    {
+        public int Calls;
+        public int FailuresRemaining;
+
+        public Task<ChatResponse> GetResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            if (FailuresRemaining > 0)
+            {
+                FailuresRemaining--;
+                throw new HttpRequestException("429 Too Many Requests");
+            }
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, name)));
+        }
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            ChatResponse response = await GetResponseAsync(messages, options, cancellationToken);
+            yield return new ChatResponseUpdate(ChatRole.Assistant, response.Text);
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose()
+        {
+        }
+    }
+
+    [Fact]
+    public async Task HealthRoundTrips_ThroughSharedStateStore()
+    {
+        var store = new SharedStateEndpointHealthStore(new InMemorySharedStateStore());
+        var health = new EndpointHealth(3, new DateTimeOffset(2026, 1, 1, 0, 5, 0, TimeSpan.Zero), true);
+
+        await store.SetAsync("primary", health);
+
+        Assert.Equal(health, await store.GetAsync("primary"));
+        Assert.Equal(EndpointHealth.Healthy, await store.GetAsync("never-seen"));
+    }
+
+    [Fact]
+    public async Task Fleet_SharesTripsAcrossRouterInstances_ViaSharedStore()
+    {
+        var time = new FakeTime();
+        // One shared backend (stand-in for Redis), two "app instances" each with their own
+        // router built over their own adapter — only the backend is shared.
+        var backend = new InMemorySharedStateStore(time);
+        var primary = new ScriptedClient("primary") { FailuresRemaining = 1 };
+        var fallback = new ScriptedClient("fallback");
+
+        ModelRouter NewInstance() => new(
+            [new("primary", primary, 0), new("fallback", fallback, 1)],
+            new ModelRouterOptions
+            {
+                TimeProvider = time,
+                HealthStore = new SharedStateEndpointHealthStore(backend),
+            });
+
+        static async Task<string> Ask(ModelRouter router) =>
+            (await router.GetResponseAsync([new ChatMessage(ChatRole.User, "hi")])).Text;
+
+        // Instance 1 pays the failover cost and trips the primary in the shared backend...
+        Assert.Equal("fallback", await Ask(NewInstance()));
+        Assert.Equal(1, primary.Calls);
+
+        // ...instance 2 sees the trip and never touches the primary.
+        Assert.Equal("fallback", await Ask(NewInstance()));
+        Assert.Equal(1, primary.Calls);
+
+        // After the cooldown, any instance half-opens it and recovery propagates fleet-wide.
+        time.Now += TimeSpan.FromSeconds(31);
+        Assert.Equal("primary", await Ask(NewInstance()));
+    }
+}

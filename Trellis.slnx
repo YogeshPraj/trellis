@@ -3,6 +3,8 @@
     <Project Path="src/Trellis.Checkpointing.Sqlite/Trellis.Checkpointing.Sqlite.csproj" />
     <Project Path="src/Trellis.Graph/Trellis.Graph.csproj" />
     <Project Path="src/Trellis.Routing/Trellis.Routing.csproj" />
+    <Project Path="src/Trellis.State.Redis/Trellis.State.Redis.csproj" />
+    <Project Path="src/Trellis.State/Trellis.State.csproj" />
     <Project Path="src/Trellis.Tools.Generator/Trellis.Tools.Generator.csproj" />
     <Project Path="src/Trellis/Trellis.csproj" />
   </Folder>

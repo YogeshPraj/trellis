@@ -21,7 +21,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🚦 **Model failover & prioritization** — `ModelRouter` spreads requests across multiple deployments by priority. A model that hits a rate limit or runs out of quota is tripped with an exponential cooldown and *skipped entirely* until it recovers — later requests go straight to the fallback with zero added latency.
 - 🧭 **Capability-aware routing** — endpoints declare what they support (tools, vision, JSON output, context window); a request needing tools never gets sent to a model that can't call them.
 - 🩺 **Typed failure handling** — status-code-based classification with `Retry-After` support; context-window and content-policy failures fail over *without* penalizing a healthy endpoint. Every policy is an interface you can swap.
-- 🌐 **Fleet-shared circuit state** — cooldown state lives behind `IEndpointHealthStore`; back it with Redis and one instance tripping a dead deployment protects all of them.
+- 🌐 **Fleet-shared circuit state** — cooldown state flows through the `Trellis.State` abstraction (`ISharedStateStore`): in-memory by default, Redis via `Trellis.State.Redis`, or any `IDistributedCache` provider (SQL Server, Cosmos, Garnet) through the built-in bridge. One instance tripping a dead deployment protects the whole fleet.
 - ⚖️ **Latency & cost-aware selection** — order same-priority deployments by observed latency (EMA) or price per token instead of plain round-robin.
 - 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
@@ -171,7 +171,7 @@ The router is built from four pluggable strategies (each an interface with a sen
 |---|---|---|
 | `IFailureClassifier` | *What went wrong* — typed `FailureKind` from status codes and messages, plus the provider's `Retry-After` when available | `DefaultFailureClassifier` |
 | `IFailurePolicy` | *What to do about it* — propagate, fail over + trip, or fail over only | `DefaultFailurePolicy` |
-| `IEndpointHealthStore` | *Where cooldown state lives* — implement over Redis/SQL so your whole fleet shares one view of which deployments are down | `InMemoryEndpointHealthStore` |
+| `IEndpointHealthStore` | *Where cooldown state lives* — `SharedStateEndpointHealthStore` adapts any `ISharedStateStore` backend so your whole fleet shares one view of which deployments are down | `InMemoryEndpointHealthStore` |
 | `IEndpointSelectionStrategy` | *How a priority tier is ordered* — round-robin, lowest observed latency, or lowest cost | `RoundRobinSelectionStrategy` |
 
 The failure policy distinguishes *provider* problems from *request* problems, LiteLLM-style:
@@ -181,6 +181,25 @@ The failure policy distinguishes *provider* problems from *request* problems, Li
 - **Unknown errors** → propagate immediately; they'd fail on every model anyway.
 
 When a provider says how long to back off (`Retry-After`), that exact duration is used instead of the exponential cooldown. Latency is tracked per endpoint (EMA), so `LowestLatencySelectionStrategy` routes to whatever is actually fastest right now, and `LowestCostSelectionStrategy` uses `ModelEndpoint.CostPerMillionTokens`.
+
+### Sharing circuit state across your fleet
+
+Cross-instance state goes through one narrow abstraction — `ISharedStateStore` in `Trellis.State` (get / set-with-TTL / remove) — with providers, not couplings:
+
+```csharp
+// Redis (Trellis.State.Redis):
+var options = new ModelRouterOptions
+{
+    HealthStore = new SharedStateEndpointHealthStore(
+        new RedisSharedStateStore(connectionMultiplexer)),
+};
+
+// ...or any existing IDistributedCache provider (SQL Server, Cosmos, Garnet):
+HealthStore = new SharedStateEndpointHealthStore(
+    new DistributedCacheSharedStateStore(distributedCache)),
+```
+
+With a shared backend, one instance hitting a dead deployment trips it for every instance, and recovery propagates fleet-wide the same way. The router never knows which backend is in play — it only sees `IEndpointHealthStore`.
 
 ### Heterogeneous providers: capabilities
 
@@ -219,6 +238,8 @@ Mark an endpoint with `ModelFeatures.ServerConversationState` and the router exp
 | `Trellis.Graph` | Graph runtime: `StateGraph<TState>`, parallel branches, streaming, interrupts, checkpointing (no AI dependency — usable for any workflow) |
 | `Trellis.Checkpointing.Sqlite` | Durable SQLite-backed checkpointer for graph workflows |
 | `Trellis.Routing` | `ModelRouter`: priority-based, capability-aware failover across model deployments with circuit-breaker cooldowns, automatic recovery, and portable conversation state |
+| `Trellis.State` | Cross-instance shared state: `ISharedStateStore` with in-memory and `IDistributedCache` providers |
+| `Trellis.State.Redis` | Redis provider for `Trellis.State` (StackExchange.Redis) |
 
 ## Building
 
@@ -244,7 +265,7 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 - [x] Status-code failure classification + `Retry-After` honoring
 - [x] Pluggable shared circuit-breaker state (`IEndpointHealthStore`)
 - [x] Latency (EMA) and cost-based tier selection strategies
-- [ ] `Trellis.Routing.Redis` health store
+- [x] `Trellis.State` shared-state abstraction with in-memory, `IDistributedCache`, and Redis providers
 - [ ] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node
