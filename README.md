@@ -2,13 +2,26 @@
 
 **Typed agents on a structured graph, for .NET.**
 
-Trellis is what [Pydantic AI](https://ai.pydantic.dev) and [LangGraph](https://langchain-ai.github.io/langgraph/) are for Python — rebuilt idiomatically for C#. No new abstraction layer: it sits directly on [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/microsoft-extensions-ai), so it works with any provider that ships an `IChatClient` (OpenAI, Anthropic, Azure OpenAI, Ollama, ...).
+Trellis lets you build AI agents and multi-step agent workflows in idiomatic C#. Define a `record`, and your agent returns it — strongly typed, validated, deserialized. Compose agents and logic into a graph of nodes with conditional routing, stream every step as it executes, and checkpoint progress so workflows survive crashes and resume where they left off.
 
-> ⚠️ Early prototype (v0.1). The API is small on purpose and will change.
+No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensions.AI`](https://learn.microsoft.com/dotnet/ai/microsoft-extensions-ai), so it works with any provider that ships an `IChatClient` — OpenAI, Anthropic, Azure OpenAI, Ollama, and more.
 
-## Why
+> ⚠️ Early release (v0.1). The API is small on purpose and will evolve.
 
-The Pydantic AI value proposition — *typed, validated agent outputs* — is almost free in C#. Define a `record`, and the model's response is requested as structured JSON and deserialized into it. No decorators, no runtime schema library:
+## Features
+
+- 🎯 **Strongly-typed agent outputs** — ask for an `Agent<FlightResult>` and get a `FlightResult` back, not a string to parse. Structured JSON output and deserialization are handled for you.
+- 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
+- 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
+- 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
+- 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
+- 🌀 **Loop protection** — a `MaxSteps` guard stops runaway cycles before they burn tokens.
+- 🔌 **Provider-agnostic** — anything with an `IChatClient` works; swap OpenAI for Ollama with one line.
+- 🗣️ **Multi-turn conversations** — pass full message histories, with system instructions prepended automatically.
+- 🧪 **Testable by design** — the whole test suite runs against a fake `IChatClient`; no API keys, no network.
+- 🧩 **Zero-AI graph core** — `Trellis.Graph` has no AI dependency at all; use it to orchestrate any workflow, agentic or not.
+
+## Typed agents in 5 lines
 
 ```csharp
 using Microsoft.Extensions.AI;
@@ -32,9 +45,9 @@ var agent = new Agent<FlightResult>(client,
         name: "search_flights")]);
 ```
 
-## Graph runtime
+## Graph workflows
 
-`Trellis.Graph` is a LangGraph-style state machine: nodes transform a state object, edges (fixed or conditional) decide what runs next, and every step can be checkpointed for resume.
+Nodes transform a state object; edges decide what runs next; every step can be checkpointed.
 
 ```csharp
 using Trellis.Graph;
@@ -57,7 +70,7 @@ await foreach (var evt in graph.StreamAsync(new ResearchState("...", null, 0)))
     Console.WriteLine($"{evt.Type}: {evt.Node}");
 ```
 
-Checkpointing is pluggable via `ICheckpointer<TState>`; runs that reuse a `ThreadId` resume from the latest checkpoint, so a crashed workflow picks up where it left off. `GraphRunOptions.MaxSteps` guards against runaway loops.
+Reuse a `ThreadId` in `GraphRunOptions` and a crashed or interrupted workflow resumes from its latest checkpoint instead of starting over.
 
 ## Packages
 
