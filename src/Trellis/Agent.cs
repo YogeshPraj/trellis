@@ -16,6 +16,7 @@ public class Agent<TResult>
     private readonly IChatClient _client;
     private readonly string? _instructions;
     private readonly ChatOptions? _chatOptions;
+    private readonly ConversationCompactor? _compactor;
 
     /// <param name="client">The underlying chat client.</param>
     /// <param name="instructions">Optional system instructions prepended to every run.</param>
@@ -24,14 +25,20 @@ public class Agent<TResult>
     /// When true (default) and tools are provided, the client is wrapped with
     /// function invocation so tool calls are executed automatically in a loop.
     /// </param>
+    /// <param name="compactor">
+    /// Optional hot/cold context management for conversation runs: when the hot history
+    /// grows past its budget, old turns are summarized and archived automatically.
+    /// </param>
     public Agent(
         IChatClient client,
         string? instructions = null,
         IReadOnlyList<AITool>? tools = null,
-        bool autoInvokeTools = true)
+        bool autoInvokeTools = true,
+        ConversationCompactor? compactor = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         _instructions = instructions;
+        _compactor = compactor;
 
         if (tools is { Count: > 0 })
         {
@@ -64,8 +71,9 @@ public class Agent<TResult>
 
     /// <summary>
     /// Runs one turn of an ongoing <see cref="Conversation"/>: appends the user prompt,
-    /// sends the canonical history (tagged with the conversation's id for conversation-aware
-    /// routers), and folds the response back into the conversation.
+    /// sends the hot history plus the rolling summary of any compacted cold context
+    /// (tagged with the conversation's routing id for conversation-aware routers), and
+    /// folds the response back into the conversation.
     /// </summary>
     public async Task<AgentRunResult<TResult>> RunAsync(
         Conversation conversation,
@@ -75,12 +83,26 @@ public class Agent<TResult>
         ArgumentNullException.ThrowIfNull(conversation);
         ArgumentNullException.ThrowIfNull(prompt);
 
+        if (_compactor is not null)
+        {
+            await _compactor.CompactIfNeededAsync(conversation, cancellationToken).ConfigureAwait(false);
+        }
         conversation.Add(new ChatMessage(ChatRole.User, prompt));
+
+        List<ChatMessage> payload = [];
+        if (conversation.Summary is string summary)
+        {
+            payload.Add(new ChatMessage(
+                ChatRole.System,
+                $"Summary of the earlier conversation (older turns were archived): {summary}"));
+        }
+        payload.AddRange(conversation.Messages);
+
         ChatOptions options = _chatOptions?.Clone() ?? new ChatOptions();
-        options.ConversationId = conversation.Id;
+        options.ConversationId = conversation.RoutingId;
 
         AgentRunResult<TResult> result = await AgentRunner
-            .RunAsync<TResult>(_client, _instructions, options, conversation.Messages, cancellationToken)
+            .RunAsync<TResult>(_client, _instructions, options, payload, cancellationToken)
             .ConfigureAwait(false);
         conversation.AddRange(result.Response.Messages);
         return result;
@@ -94,8 +116,9 @@ public sealed class Agent : Agent<string>
         IChatClient client,
         string? instructions = null,
         IReadOnlyList<AITool>? tools = null,
-        bool autoInvokeTools = true)
-        : base(client, instructions, tools, autoInvokeTools)
+        bool autoInvokeTools = true,
+        ConversationCompactor? compactor = null)
+        : base(client, instructions, tools, autoInvokeTools, compactor)
     {
     }
 }

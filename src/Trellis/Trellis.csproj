@@ -13,17 +13,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Trellis.Graph\Trellis.Graph.csproj" />
-    <ProjectReference Include="..\Trellis.Tools.Generator\Trellis.Tools.Generator.csproj"
-                      OutputItemType="Analyzer"
-                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Trellis.Tools.Generator\Trellis.Tools.Generator.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Trellis.State\Trellis.State.csproj" />
   </ItemGroup>
 
   <!-- Ship the [Tool] source generator inside this package. -->
   <ItemGroup>
-    <None Include="..\Trellis.Tools.Generator\bin\$(Configuration)\netstandard2.0\Trellis.Tools.Generator.dll"
-          Pack="true"
-          PackagePath="analyzers/dotnet/cs"
-          Visible="false" />
+    <None Include="..\Trellis.Tools.Generator\bin\$(Configuration)\netstandard2.0\Trellis.Tools.Generator.dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
   </ItemGroup>
 
 </Project>

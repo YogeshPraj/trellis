@@ -24,6 +24,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🌐 **Fleet-shared circuit state** — cooldown state flows through the `Trellis.State` abstraction (`ISharedStateStore`): in-memory by default, Redis via `Trellis.State.Redis`, or any `IDistributedCache` provider (SQL Server, Cosmos, Garnet) through the built-in bridge. One instance tripping a dead deployment protects the whole fleet.
 - ⚖️ **Latency & cost-aware selection** — order same-priority deployments by observed latency (EMA) or price per token instead of plain round-robin.
 - 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
+- 🔥❄️ **Hot / cold context** — long conversations stay bounded: recent turns stay *hot* (verbatim in the prompt); older turns go *cold* — folded into a rolling summary by a cheap model and archived verbatim to any store. Context windows never overflow, token costs stay flat, nothing is lost.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
 - 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
@@ -230,6 +231,27 @@ await agent.RunAsync(conversation, "What about hotels near the airport?");  // f
 
 Mark an endpoint with `ModelFeatures.ServerConversationState` and the router exploits it automatically: follow-up turns send only the unsynced messages plus the provider's own conversation id. The moment a request routes anywhere else — failover, load balancing, recovery — that endpoint receives the complete canonical history instead. Mid-conversation failover between providers is seamless, and your conversation is never trapped inside one vendor's API.
 
+### Hot & cold context: conversations that never overflow
+
+A long-running conversation can't send its whole history forever. Give the agent a `ConversationCompactor` and the history is tiered automatically:
+
+- **Hot** — the most recent turns, kept verbatim and sent every request.
+- **Cold** — once the hot history exceeds its budget, the oldest turns are (1) folded into a **rolling summary** by an `IConversationSummarizer` (point it at a small, cheap model) and (2) **archived verbatim** through an `IConversationArchive`, so the full transcript remains retrievable for display, audit, or search.
+
+```csharp
+var compactor = new ConversationCompactor(
+    summarizer: new ChatClientConversationSummarizer(cheapClient),   // e.g. a local or mini model
+    archive: new SharedStateConversationArchive(new RedisSharedStateStore(mux)),
+    options: new CompactionOptions { MaxHotMessages = 40, KeepRecentMessages = 12 });
+
+var agent = new Agent(router, instructions: "You are a travel assistant.", compactor: compactor);
+
+// Turn 500 costs the same as turn 5: summary + hot tail, never the whole transcript.
+await agent.RunAsync(conversation, "so which hotel did we settle on again?");
+```
+
+What the model sees each turn: your instructions → *"Summary of the earlier conversation: ..."* → the hot tail. Each compaction bumps the conversation's `ContextEpoch`, which changes its routing id — so a conversation-aware router discards provider-side deltas and replays the compacted history in full (a server-side delta against the pre-compaction transcript would be wrong). The archive reuses `ISharedStateStore`, so cold context can live in memory, Redis, or any `IDistributedCache` backend.
+
 ## Packages
 
 | Package | What's in it |
@@ -266,6 +288,8 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 - [x] Pluggable shared circuit-breaker state (`IEndpointHealthStore`)
 - [x] Latency (EMA) and cost-based tier selection strategies
 - [x] `Trellis.State` shared-state abstraction with in-memory, `IDistributedCache`, and Redis providers
+- [x] Hot/cold conversation context (rolling summary + verbatim archive)
+- [ ] Token-budget-based compaction thresholds (currently message-count based)
 - [ ] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node
