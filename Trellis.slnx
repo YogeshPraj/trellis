@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Trellis.Graph/Trellis.Graph.csproj" />
+    <Project Path="src/Trellis/Trellis.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Trellis.Tests/Trellis.Tests.csproj" />
+  </Folder>
+</Solution>
