@@ -61,6 +61,30 @@ public class Agent<TResult>
         ArgumentNullException.ThrowIfNull(messages);
         return AgentRunner.RunAsync<TResult>(_client, _instructions, _chatOptions, messages, cancellationToken);
     }
+
+    /// <summary>
+    /// Runs one turn of an ongoing <see cref="Conversation"/>: appends the user prompt,
+    /// sends the canonical history (tagged with the conversation's id for conversation-aware
+    /// routers), and folds the response back into the conversation.
+    /// </summary>
+    public async Task<AgentRunResult<TResult>> RunAsync(
+        Conversation conversation,
+        string prompt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(conversation);
+        ArgumentNullException.ThrowIfNull(prompt);
+
+        conversation.Add(new ChatMessage(ChatRole.User, prompt));
+        ChatOptions options = _chatOptions?.Clone() ?? new ChatOptions();
+        options.ConversationId = conversation.Id;
+
+        AgentRunResult<TResult> result = await AgentRunner
+            .RunAsync<TResult>(_client, _instructions, options, conversation.Messages, cancellationToken)
+            .ConfigureAwait(false);
+        conversation.AddRange(result.Response.Messages);
+        return result;
+    }
 }
 
 /// <summary>A plain-text agent — shorthand for <c>Agent&lt;string&gt;</c>.</summary>

@@ -6,7 +6,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <Authors>Yogesh Prajapati</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

@@ -19,6 +19,8 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - ✋ **Human-in-the-loop interrupts** — pause a run in front of any node (`InterruptBefore`), let a human review or edit the state, then resume from the same thread id.
 - 🗄️ **Durable SQLite checkpointing** — `Trellis.Checkpointing.Sqlite` persists progress to a database file; workflows survive crashes and process restarts.
 - 🚦 **Model failover & prioritization** — `ModelRouter` spreads requests across multiple deployments by priority. A model that hits a rate limit or runs out of quota is tripped with an exponential cooldown and *skipped entirely* until it recovers — later requests go straight to the fallback with zero added latency.
+- 🧭 **Capability-aware routing** — endpoints declare what they support (tools, vision, JSON output, context window); a request needing tools never gets sent to a model that can't call them.
+- 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
 - 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
@@ -158,6 +160,35 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 
 Errors that would fail on *every* model (e.g. malformed requests) propagate immediately instead of cascading through your deployments — the classifier is pluggable via `ShouldTrip`. If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
 
+### Heterogeneous providers: capabilities
+
+Deployments rarely support the same things. Declare per-endpoint capabilities and the router only considers endpoints that can actually serve the request — a tool-calling request skips the model without function calling, an oversized prompt skips the small context window, instead of failing there first:
+
+```csharp
+new ModelEndpoint("gpt-4o", openaiClient, priority: 0),                       // default: tools + vision + JSON
+new ModelEndpoint("small-local", ollamaClient, priority: 2, new ModelCapabilities
+{
+    Features = ModelFeatures.JsonResponseFormat,                              // no tools, no vision
+    MaxInputTokens = 8_000,
+}),
+```
+
+If *no* registered endpoint supports what a request needs, you get a `NoCompatibleModelException` up front — not a provider error after a doomed round-trip.
+
+### Heterogeneous providers: conversation context
+
+Some providers manage conversation state server-side (OpenAI's Responses API); most are stateless. Trellis resolves the mismatch with one rule: **the client-side `Conversation` is always the source of truth**, and provider-side state is only an optimization.
+
+```csharp
+var agent = new Agent(router, instructions: "You are a travel assistant.");
+var conversation = new Conversation();
+
+await agent.RunAsync(conversation, "Find me flights to Pune");
+await agent.RunAsync(conversation, "What about hotels near the airport?");  // full context, any provider
+```
+
+Mark an endpoint with `ModelFeatures.ServerConversationState` and the router exploits it automatically: follow-up turns send only the unsynced messages plus the provider's own conversation id. The moment a request routes anywhere else — failover, load balancing, recovery — that endpoint receives the complete canonical history instead. Mid-conversation failover between providers is seamless, and your conversation is never trapped inside one vendor's API.
+
 ## Packages
 
 | Package | What's in it |
@@ -165,7 +196,7 @@ Errors that would fail on *every* model (e.g. malformed requests) propagate imme
 | `Trellis` | Typed agents (`Agent<TResult>`, `Agent<TDeps, TResult>`), the `[Tool]` source generator, and agent-as-node graph helpers |
 | `Trellis.Graph` | Graph runtime: `StateGraph<TState>`, parallel branches, streaming, interrupts, checkpointing (no AI dependency — usable for any workflow) |
 | `Trellis.Checkpointing.Sqlite` | Durable SQLite-backed checkpointer for graph workflows |
-| `Trellis.Routing` | `ModelRouter`: priority-based failover across model deployments with circuit-breaker cooldowns and automatic recovery |
+| `Trellis.Routing` | `ModelRouter`: priority-based, capability-aware failover across model deployments with circuit-breaker cooldowns, automatic recovery, and portable conversation state |
 
 ## Building
 
@@ -185,6 +216,8 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 - [x] Human-in-the-loop interrupts
 - [x] NuGet release pipeline (packages publish on version tags)
 - [x] Model failover & prioritization (`Trellis.Routing`)
+- [x] Capability-aware routing (tools / vision / JSON / context window)
+- [x] Portable conversation state across stateful and stateless providers
 - [ ] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node

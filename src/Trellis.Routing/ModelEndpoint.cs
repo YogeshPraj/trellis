@@ -11,13 +11,18 @@ public sealed class ModelEndpoint
     /// Lower is preferred. Endpoints with equal priority share load round-robin;
     /// higher-priority tiers are only used when every lower tier is cooling down.
     /// </param>
-    public ModelEndpoint(string name, IChatClient client, int priority = 0)
+    /// <param name="capabilities">
+    /// What this deployment supports. Requests needing an unsupported feature skip it.
+    /// Defaults to <see cref="ModelCapabilities.Default"/>.
+    /// </param>
+    public ModelEndpoint(string name, IChatClient client, int priority = 0, ModelCapabilities? capabilities = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(client);
         Name = name;
         Client = client;
         Priority = priority;
+        Capabilities = capabilities ?? ModelCapabilities.Default;
     }
 
     public string Name { get; }
@@ -25,6 +30,8 @@ public sealed class ModelEndpoint
     public IChatClient Client { get; }
 
     public int Priority { get; }
+
+    public ModelCapabilities Capabilities { get; }
 }
 
 /// <summary>What the router does when every endpoint is cooling down.</summary>
