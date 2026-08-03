@@ -85,7 +85,7 @@ Reuse a `ThreadId` in `GraphRunOptions` and a crashed or interrupted workflow re
 dotnet test
 ```
 
-Requires the .NET 8 SDK or later. No API keys needed for the test suite — agent tests run against a fake `IChatClient`.
+Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests run against a fake `IChatClient`.
 
 ## Roadmap
 
