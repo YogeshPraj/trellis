@@ -20,6 +20,9 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🗄️ **Durable SQLite checkpointing** — `Trellis.Checkpointing.Sqlite` persists progress to a database file; workflows survive crashes and process restarts.
 - 🚦 **Model failover & prioritization** — `ModelRouter` spreads requests across multiple deployments by priority. A model that hits a rate limit or runs out of quota is tripped with an exponential cooldown and *skipped entirely* until it recovers — later requests go straight to the fallback with zero added latency.
 - 🧭 **Capability-aware routing** — endpoints declare what they support (tools, vision, JSON output, context window); a request needing tools never gets sent to a model that can't call them.
+- 🩺 **Typed failure handling** — status-code-based classification with `Retry-After` support; context-window and content-policy failures fail over *without* penalizing a healthy endpoint. Every policy is an interface you can swap.
+- 🌐 **Fleet-shared circuit state** — cooldown state lives behind `IEndpointHealthStore`; back it with Redis and one instance tripping a dead deployment protects all of them.
+- ⚖️ **Latency & cost-aware selection** — order same-priority deployments by observed latency (EMA) or price per token instead of plain round-robin.
 - 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
@@ -158,7 +161,26 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 3. Repeated failures double the cooldown (30s → 60s → 120s → ... up to `MaxCooldown`).
 4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
 
-Errors that would fail on *every* model (e.g. malformed requests) propagate immediately instead of cascading through your deployments — the classifier is pluggable via `ShouldTrip`. If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
+### Typed failure handling
+
+The router is built from four pluggable strategies (each an interface with a sensible default) so every policy decision is yours to override without touching routing code:
+
+| Extension point | Decides | Default |
+|---|---|---|
+| `IFailureClassifier` | *What went wrong* — typed `FailureKind` from status codes and messages, plus the provider's `Retry-After` when available | `DefaultFailureClassifier` |
+| `IFailurePolicy` | *What to do about it* — propagate, fail over + trip, or fail over only | `DefaultFailurePolicy` |
+| `IEndpointHealthStore` | *Where cooldown state lives* — implement over Redis/SQL so your whole fleet shares one view of which deployments are down | `InMemoryEndpointHealthStore` |
+| `IEndpointSelectionStrategy` | *How a priority tier is ordered* — round-robin, lowest observed latency, or lowest cost | `RoundRobinSelectionStrategy` |
+
+The failure policy distinguishes *provider* problems from *request* problems, LiteLLM-style:
+
+- **Rate limit / quota / timeout / 5xx** → fail over **and trip** the endpoint (it's unhealthy).
+- **Context-window overflow / content-policy rejection** → fail over **without tripping** — the model is healthy, this request just doesn't fit it; a bigger-window or more permissive deployment gets it instead, and the endpoint stays in rotation for the next request.
+- **Unknown errors** → propagate immediately; they'd fail on every model anyway.
+
+When a provider says how long to back off (`Retry-After`), that exact duration is used instead of the exponential cooldown. Latency is tracked per endpoint (EMA), so `LowestLatencySelectionStrategy` routes to whatever is actually fastest right now, and `LowestCostSelectionStrategy` uses `ModelEndpoint.CostPerMillionTokens`.
 
 ### Heterogeneous providers: capabilities
 
@@ -218,6 +240,11 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 - [x] Model failover & prioritization (`Trellis.Routing`)
 - [x] Capability-aware routing (tools / vision / JSON / context window)
 - [x] Portable conversation state across stateful and stateless providers
+- [x] Error-type-specific failover (context window / content policy vs rate limit)
+- [x] Status-code failure classification + `Retry-After` honoring
+- [x] Pluggable shared circuit-breaker state (`IEndpointHealthStore`)
+- [x] Latency (EMA) and cost-based tier selection strategies
+- [ ] `Trellis.Routing.Redis` health store
 - [ ] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node

@@ -32,6 +32,12 @@ public sealed class ModelEndpoint
     public int Priority { get; }
 
     public ModelCapabilities Capabilities { get; }
+
+    /// <summary>
+    /// Blended price per million tokens, used by <see cref="LowestCostSelectionStrategy"/>.
+    /// Endpoints without a declared cost are considered most expensive.
+    /// </summary>
+    public double? CostPerMillionTokens { get; init; }
 }
 
 /// <summary>What the router does when every endpoint is cooling down.</summary>
@@ -53,12 +59,23 @@ public sealed class ModelRouterOptions
     /// <summary>Upper bound for the exponential cooldown.</summary>
     public TimeSpan MaxCooldown { get; set; } = TimeSpan.FromMinutes(10);
 
+    /// <summary>Turns provider exceptions into typed failures (status codes, Retry-After).</summary>
+    public IFailureClassifier FailureClassifier { get; set; } = new DefaultFailureClassifier();
+
     /// <summary>
-    /// Decides whether an exception should trip the endpoint and fail over (true) or
-    /// propagate to the caller (false — e.g. a malformed request that every model would reject).
-    /// Defaults to <see cref="ModelRouter.DefaultShouldTrip"/>.
+    /// Maps failure kinds to actions — e.g. context-window overflows fail over without
+    /// tripping the (healthy) endpoint, unknown errors propagate.
     /// </summary>
-    public Func<Exception, bool> ShouldTrip { get; set; } = ModelRouter.DefaultShouldTrip;
+    public IFailurePolicy FailurePolicy { get; set; } = new DefaultFailurePolicy();
+
+    /// <summary>
+    /// Where circuit-breaker state lives. Swap the in-process default for a shared store
+    /// (Redis, SQL) so all app instances agree on which deployments are cooling down.
+    /// </summary>
+    public IEndpointHealthStore HealthStore { get; set; } = new InMemoryEndpointHealthStore();
+
+    /// <summary>How endpoints within one priority tier are ordered per request.</summary>
+    public IEndpointSelectionStrategy SelectionStrategy { get; set; } = new RoundRobinSelectionStrategy();
 
     /// <summary>Behavior when every endpoint is cooling down. Default: try the soonest-recovering one.</summary>
     public AllTrippedBehavior AllTrippedBehavior { get; set; } = AllTrippedBehavior.TryAnyway;

@@ -1,35 +1,33 @@
-using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.AI;
 
 namespace Trellis.Routing;
 
 /// <summary>
-/// An <see cref="IChatClient"/> that routes across multiple model deployments by priority
-/// with circuit-breaker failover and capability awareness. When an endpoint fails with a
-/// transient error (rate limit, exhausted quota, outage) it is tripped: taken out of rotation
-/// for an exponentially growing cooldown, so subsequent requests go straight to the next
-/// deployment with no added latency. After the cooldown, the next request retries the
-/// endpoint and restores it on success.
+/// An <see cref="IChatClient"/> that routes across multiple model deployments by priority,
+/// with typed circuit-breaker failover and capability awareness. The router itself only
+/// orchestrates; the moving parts are pluggable strategies on <see cref="ModelRouterOptions"/>:
+/// <see cref="IFailureClassifier"/> (what went wrong), <see cref="IFailurePolicy"/> (what to
+/// do about it), <see cref="IEndpointHealthStore"/> (where cooldown state lives — share it
+/// across instances), and <see cref="IEndpointSelectionStrategy"/> (how a tier is ordered:
+/// round-robin, lowest latency, lowest cost).
 ///
-/// Endpoints declare <see cref="ModelCapabilities"/>; requests that need tools, vision, JSON
-/// output, or a large context only consider endpoints that support them.
+/// A tripped endpoint is skipped entirely until its cooldown (the provider's Retry-After
+/// when known, exponential otherwise) expires, so failover adds zero latency to later
+/// requests. Request-shaped failures — context-window overflow, content policy — fail over
+/// WITHOUT tripping the endpoint, since the model itself is healthy.
 ///
-/// Conversation state stays canonical on the client: callers always pass the full message
-/// history (set <see cref="ChatOptions.ConversationId"/> to your own logical id). For
-/// endpoints with <see cref="ModelFeatures.ServerConversationState"/> the router transparently
-/// sends only the unsynced tail plus the provider's conversation id; on failover to a
-/// stateless endpoint it replays the full history, so no context is ever lost.
+/// Conversation state stays canonical on the client: callers pass full history with a
+/// logical <see cref="ChatOptions.ConversationId"/>; endpoints with
+/// <see cref="ModelFeatures.ServerConversationState"/> transparently receive only the
+/// unsynced tail plus their provider id, and failover replays the full history.
 /// </summary>
 public sealed class ModelRouter : IChatClient
 {
-    private sealed class EndpointState(ModelEndpoint endpoint)
+    private readonly struct Candidate(ModelEndpoint endpoint, EndpointHealth health)
     {
         public ModelEndpoint Endpoint { get; } = endpoint;
-        public readonly object Lock = new();
-        public int ConsecutiveFailures;
-        public DateTimeOffset UnavailableUntil = DateTimeOffset.MinValue;
-        public bool WasTripped;
+        public EndpointHealth Health { get; } = health;
     }
 
     private readonly struct Requirements
@@ -71,11 +69,12 @@ public sealed class ModelRouter : IChatClient
             $"tools={NeedsTools}, vision={NeedsVision}, json={NeedsJson}, ~{EstimatedTokens} tokens";
     }
 
-    private readonly EndpointState[] _states;
+    private readonly ModelEndpoint[] _endpoints;
     private readonly ModelRouterOptions _options;
     private readonly TimeProvider _time;
-    private readonly ConcurrentDictionary<string, (string ProviderId, int SyncedCount)> _conversationSync = new();
-    private int _roundRobin = -1;
+    private readonly ConversationSyncManager _conversations = new();
+    private readonly MetricsTracker _metrics = new();
+    private int _rotation = -1;
 
     public ModelRouter(IReadOnlyList<ModelEndpoint> endpoints, ModelRouterOptions? options = null)
     {
@@ -84,35 +83,9 @@ public sealed class ModelRouter : IChatClient
         {
             throw new ArgumentException("At least one endpoint is required.", nameof(endpoints));
         }
-        _states = [.. endpoints.OrderBy(e => e.Priority).Select(e => new EndpointState(e))];
+        _endpoints = [.. endpoints.OrderBy(e => e.Priority)];
         _options = options ?? new ModelRouterOptions();
         _time = _options.TimeProvider ?? TimeProvider.System;
-    }
-
-    /// <summary>
-    /// Default transient-error classifier: trips on anything that looks like a rate limit,
-    /// exhausted quota, timeout, or server-side outage; propagates everything else.
-    /// </summary>
-    public static bool DefaultShouldTrip(Exception exception)
-    {
-        if (exception is HttpRequestException or TimeoutException or TaskCanceledException)
-        {
-            return true;
-        }
-
-        string text = exception.ToString();
-        return text.Contains("429", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("ratelimit", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("too many requests", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("quota", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("overloaded", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("insufficient", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("timeout", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("unavailable", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("500", StringComparison.Ordinal)
-            || text.Contains("502", StringComparison.Ordinal)
-            || text.Contains("503", StringComparison.Ordinal);
     }
 
     public async Task<ChatResponse> GetResponseAsync(
@@ -125,31 +98,37 @@ public sealed class ModelRouter : IChatClient
         ThrowIfNoneCompatible(requirements);
         List<Exception> attempts = [];
 
-        foreach (EndpointState state in SelectionOrder(requirements))
+        foreach (Candidate candidate in await SelectAsync(requirements, cancellationToken).ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            (IList<ChatMessage> send, ChatOptions? sendOptions) = PrepareForEndpoint(state, full, options, streaming: false);
+            (IList<ChatMessage> send, ChatOptions? sendOptions) =
+                _conversations.Prepare(candidate.Endpoint, full, options, streaming: false);
+
+            long started = _time.GetTimestamp();
             try
             {
-                ChatResponse response = await state.Endpoint.Client
+                ChatResponse response = await candidate.Endpoint.Client
                     .GetResponseAsync(send, sendOptions, cancellationToken)
                     .ConfigureAwait(false);
-                MarkSuccess(state);
-                RecordConversationSync(state, full, options, response);
+                _metrics.Record(candidate.Endpoint.Name, _time.GetElapsedTime(started).TotalMilliseconds, success: true);
+                await MarkSuccessAsync(candidate, cancellationToken).ConfigureAwait(false);
+                _conversations.Record(candidate.Endpoint, full, options, response);
                 return response;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 throw;
             }
-            catch (Exception ex) when (_options.ShouldTrip(ex))
+            catch (Exception ex)
             {
-                Trip(state, ex);
-                attempts.Add(ex);
+                if (!await HandleFailureAsync(candidate, ex, attempts, cancellationToken).ConfigureAwait(false))
+                {
+                    throw;
+                }
             }
         }
 
-        throw AllUnavailable(attempts);
+        throw await AllUnavailableAsync(attempts, cancellationToken).ConfigureAwait(false);
     }
 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
@@ -162,18 +141,20 @@ public sealed class ModelRouter : IChatClient
         ThrowIfNoneCompatible(requirements);
         List<Exception> attempts = [];
 
-        foreach (EndpointState state in SelectionOrder(requirements))
+        foreach (Candidate candidate in await SelectAsync(requirements, cancellationToken).ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            (IList<ChatMessage> send, ChatOptions? sendOptions) = PrepareForEndpoint(state, full, options, streaming: true);
+            (IList<ChatMessage> send, ChatOptions? sendOptions) =
+                _conversations.Prepare(candidate.Endpoint, full, options, streaming: true);
 
             // Fail over only until the first token arrives; after that the stream is committed.
             IAsyncEnumerator<ChatResponseUpdate>? stream = null;
             bool hasFirst;
             ChatResponseUpdate? first = null;
+            long started = _time.GetTimestamp();
             try
             {
-                stream = state.Endpoint.Client
+                stream = candidate.Endpoint.Client
                     .GetStreamingResponseAsync(send, sendOptions, cancellationToken)
                     .GetAsyncEnumerator(cancellationToken);
                 hasFirst = await stream.MoveNextAsync().ConfigureAwait(false);
@@ -190,18 +171,21 @@ public sealed class ModelRouter : IChatClient
                 }
                 throw;
             }
-            catch (Exception ex) when (_options.ShouldTrip(ex))
+            catch (Exception ex)
             {
-                Trip(state, ex);
-                attempts.Add(ex);
                 if (stream is not null)
                 {
                     await stream.DisposeAsync().ConfigureAwait(false);
                 }
+                if (!await HandleFailureAsync(candidate, ex, attempts, cancellationToken).ConfigureAwait(false))
+                {
+                    throw;
+                }
                 continue;
             }
 
-            MarkSuccess(state);
+            _metrics.Record(candidate.Endpoint.Name, _time.GetElapsedTime(started).TotalMilliseconds, success: true);
+            await MarkSuccessAsync(candidate, cancellationToken).ConfigureAwait(false);
             try
             {
                 if (hasFirst)
@@ -220,15 +204,7 @@ public sealed class ModelRouter : IChatClient
             yield break;
         }
 
-        throw AllUnavailable(attempts);
-    }
-
-    private void ThrowIfNoneCompatible(Requirements requirements)
-    {
-        if (!_states.Any(s => IsCompatible(s.Endpoint.Capabilities, requirements)))
-        {
-            throw new NoCompatibleModelException($"No registered endpoint supports this request ({requirements}).");
-        }
+        throw await AllUnavailableAsync(attempts, cancellationToken).ConfigureAwait(false);
     }
 
     public object? GetService(Type serviceType, object? serviceKey = null) =>
@@ -240,47 +216,109 @@ public sealed class ModelRouter : IChatClient
     }
 
     /// <summary>
-    /// Compatible + available endpoints first (priority order, round-robin within a tier).
-    /// When everything compatible is cooling down, either degrade to the soonest-recovering
-    /// endpoint or yield nothing, per <see cref="ModelRouterOptions.AllTrippedBehavior"/>.
+    /// Classifies a failure and applies the policy. Returns true when the router should
+    /// move on to the next endpoint, false when the error must propagate.
     /// </summary>
-    private IEnumerable<EndpointState> SelectionOrder(Requirements requirements)
+    private async ValueTask<bool> HandleFailureAsync(
+        Candidate candidate,
+        Exception exception,
+        List<Exception> attempts,
+        CancellationToken cancellationToken)
+    {
+        FailureClassification classification = _options.FailureClassifier.Classify(exception);
+        FailureAction action = _options.FailurePolicy.Decide(classification);
+        if (action == FailureAction.Propagate)
+        {
+            return false;
+        }
+
+        _metrics.Record(candidate.Endpoint.Name, 0, success: false);
+        attempts.Add(exception);
+        if (action == FailureAction.FailoverAndTrip)
+        {
+            await TripAsync(candidate, classification, exception, cancellationToken).ConfigureAwait(false);
+        }
+        return true;
+    }
+
+    private async ValueTask TripAsync(
+        Candidate candidate,
+        FailureClassification classification,
+        Exception cause,
+        CancellationToken cancellationToken)
+    {
+        int failures = candidate.Health.ConsecutiveFailures + 1;
+        TimeSpan cooldown = classification.RetryAfter ?? ExponentialCooldown(failures);
+        DateTimeOffset until = _time.GetUtcNow() + cooldown;
+        await _options.HealthStore
+            .SetAsync(candidate.Endpoint.Name, new EndpointHealth(failures, until, Tripped: true), cancellationToken)
+            .ConfigureAwait(false);
+        _options.OnEndpointTripped?.Invoke(candidate.Endpoint, cause, until);
+    }
+
+    private async ValueTask MarkSuccessAsync(Candidate candidate, CancellationToken cancellationToken)
+    {
+        if (!candidate.Health.Tripped && candidate.Health.ConsecutiveFailures == 0)
+        {
+            return;
+        }
+        await _options.HealthStore
+            .SetAsync(candidate.Endpoint.Name, EndpointHealth.Healthy, cancellationToken)
+            .ConfigureAwait(false);
+        if (candidate.Health.Tripped)
+        {
+            _options.OnEndpointRecovered?.Invoke(candidate.Endpoint);
+        }
+    }
+
+    private TimeSpan ExponentialCooldown(int consecutiveFailures)
+    {
+        double factor = Math.Pow(2, Math.Min(consecutiveFailures - 1, 10));
+        return TimeSpan.FromTicks(Math.Min(
+            (long)(_options.BaseCooldown.Ticks * factor),
+            _options.MaxCooldown.Ticks));
+    }
+
+    /// <summary>
+    /// Builds this request's attempt order: compatible + available endpoints by priority
+    /// tier (each tier ordered by the selection strategy); when everything compatible is
+    /// cooling down, either degrade to the soonest-recovering endpoints or return nothing,
+    /// per <see cref="ModelRouterOptions.AllTrippedBehavior"/>.
+    /// </summary>
+    private async ValueTask<List<Candidate>> SelectAsync(Requirements requirements, CancellationToken cancellationToken)
     {
         DateTimeOffset now = _time.GetUtcNow();
-        List<EndpointState> available = [];
-        List<EndpointState> coolingDown = [];
-        foreach (EndpointState state in _states)
+        List<Candidate> available = [];
+        List<Candidate> coolingDown = [];
+        foreach (ModelEndpoint endpoint in _endpoints)
         {
-            if (!IsCompatible(state.Endpoint.Capabilities, requirements))
+            if (!IsCompatible(endpoint.Capabilities, requirements))
             {
                 continue;
             }
-            (state.UnavailableUntil <= now ? available : coolingDown).Add(state);
+            EndpointHealth health = await _options.HealthStore.GetAsync(endpoint.Name, cancellationToken).ConfigureAwait(false);
+            (health.UnavailableUntil <= now ? available : coolingDown).Add(new Candidate(endpoint, health));
         }
 
-        int rotation = Interlocked.Increment(ref _roundRobin);
-        IEnumerable<EndpointState> ordered = available
-            .GroupBy(s => s.Endpoint.Priority)
-            .OrderBy(g => g.Key)
-            .SelectMany(g =>
-            {
-                List<EndpointState> tier = [.. g];
-                int offset = tier.Count > 1 ? Math.Abs(rotation % tier.Count) : 0;
-                return tier.Skip(offset).Concat(tier.Take(offset));
-            });
-
-        foreach (EndpointState state in ordered)
+        var context = new SelectionContext(Interlocked.Increment(ref _rotation), _metrics);
+        List<Candidate> order = [];
+        foreach (IGrouping<int, Candidate> tierGroup in available.GroupBy(c => c.Endpoint.Priority).OrderBy(g => g.Key))
         {
-            yield return state;
+            Dictionary<ModelEndpoint, Candidate> byEndpoint = tierGroup.ToDictionary(c => c.Endpoint);
+            foreach (ModelEndpoint endpoint in _options.SelectionStrategy.OrderTier([.. byEndpoint.Keys], context))
+            {
+                if (byEndpoint.TryGetValue(endpoint, out Candidate candidate))
+                {
+                    order.Add(candidate);
+                }
+            }
         }
 
         if (available.Count == 0 && _options.AllTrippedBehavior == AllTrippedBehavior.TryAnyway)
         {
-            foreach (EndpointState state in coolingDown.OrderBy(s => s.UnavailableUntil))
-            {
-                yield return state;
-            }
+            order.AddRange(coolingDown.OrderBy(c => c.Health.UnavailableUntil));
         }
+        return order;
     }
 
     private static bool IsCompatible(ModelCapabilities capabilities, Requirements requirements)
@@ -304,108 +342,26 @@ public sealed class ModelRouter : IChatClient
         return true;
     }
 
-    /// <summary>
-    /// Adapts the request to the endpoint's conversation model. Callers always supply the
-    /// canonical full history; endpoints with server-side state get only the unsynced tail
-    /// plus their provider conversation id, everyone else gets the full history. Streaming
-    /// calls always replay full history (sync bookkeeping for streams is not reliable) and
-    /// invalidate the endpoint's sync so the next call re-establishes it.
-    /// </summary>
-    private (IList<ChatMessage> Messages, ChatOptions? Options) PrepareForEndpoint(
-        EndpointState state,
-        IList<ChatMessage> full,
-        ChatOptions? options,
-        bool streaming)
+    private void ThrowIfNoneCompatible(Requirements requirements)
     {
-        if (options?.ConversationId is not string logicalId)
+        if (!_endpoints.Any(e => IsCompatible(e.Capabilities, requirements)))
         {
-            return (full, options);
-        }
-
-        bool serverState = state.Endpoint.Capabilities.Supports(ModelFeatures.ServerConversationState);
-        string key = SyncKey(logicalId, state.Endpoint.Name);
-
-        if (!serverState || streaming)
-        {
-            if (serverState)
-            {
-                _conversationSync.TryRemove(key, out _);
-            }
-            // The logical id is ours, not the provider's — never leak it to a client.
-            ChatOptions stripped = options.Clone();
-            stripped.ConversationId = null;
-            return (full, stripped);
-        }
-
-        if (_conversationSync.TryGetValue(key, out (string ProviderId, int SyncedCount) sync)
-            && sync.SyncedCount <= full.Count)
-        {
-            ChatOptions delta = options.Clone();
-            delta.ConversationId = sync.ProviderId;
-            return ([.. full.Skip(sync.SyncedCount)], delta);
-        }
-
-        ChatOptions fresh = options.Clone();
-        fresh.ConversationId = null;
-        return (full, fresh);
-    }
-
-    private void RecordConversationSync(
-        EndpointState state,
-        IList<ChatMessage> full,
-        ChatOptions? options,
-        ChatResponse response)
-    {
-        if (options?.ConversationId is not string logicalId
-            || !state.Endpoint.Capabilities.Supports(ModelFeatures.ServerConversationState)
-            || response.ConversationId is not string providerId)
-        {
-            return;
-        }
-        // The server now knows the full input plus the messages it just generated.
-        _conversationSync[SyncKey(logicalId, state.Endpoint.Name)] = (providerId, full.Count + response.Messages.Count);
-    }
-
-    private static string SyncKey(string logicalId, string endpointName) => logicalId + "|" + endpointName;
-
-    private void Trip(EndpointState state, Exception cause)
-    {
-        DateTimeOffset until;
-        lock (state.Lock)
-        {
-            state.ConsecutiveFailures++;
-            double factor = Math.Pow(2, Math.Min(state.ConsecutiveFailures - 1, 10));
-            TimeSpan cooldown = TimeSpan.FromTicks(Math.Min(
-                (long)(_options.BaseCooldown.Ticks * factor),
-                _options.MaxCooldown.Ticks));
-            until = _time.GetUtcNow() + cooldown;
-            state.UnavailableUntil = until;
-            state.WasTripped = true;
-        }
-        _options.OnEndpointTripped?.Invoke(state.Endpoint, cause, until);
-    }
-
-    private void MarkSuccess(EndpointState state)
-    {
-        bool recovered;
-        lock (state.Lock)
-        {
-            recovered = state.WasTripped;
-            state.ConsecutiveFailures = 0;
-            state.UnavailableUntil = DateTimeOffset.MinValue;
-            state.WasTripped = false;
-        }
-        if (recovered)
-        {
-            _options.OnEndpointRecovered?.Invoke(state.Endpoint);
+            throw new NoCompatibleModelException($"No registered endpoint supports this request ({requirements}).");
         }
     }
 
-    private AllModelsUnavailableException AllUnavailable(List<Exception> attempts)
+    private async ValueTask<AllModelsUnavailableException> AllUnavailableAsync(
+        List<Exception> attempts,
+        CancellationToken cancellationToken)
     {
-        DateTimeOffset earliest = _states.Min(s => s.UnavailableUntil);
+        DateTimeOffset earliest = DateTimeOffset.MaxValue;
+        foreach (ModelEndpoint endpoint in _endpoints)
+        {
+            EndpointHealth health = await _options.HealthStore.GetAsync(endpoint.Name, cancellationToken).ConfigureAwait(false);
+            earliest = health.UnavailableUntil < earliest ? health.UnavailableUntil : earliest;
+        }
         return new AllModelsUnavailableException(
-            $"All {_states.Length} model endpoints are unavailable; earliest recovery at {earliest:O}.",
+            $"All {_endpoints.Length} model endpoints are unavailable; earliest recovery at {earliest:O}.",
             attempts);
     }
 }
