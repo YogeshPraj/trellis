@@ -21,6 +21,15 @@ public enum ModelFeatures
     /// The router exploits this per endpoint while keeping the client-side history canonical,
     /// so failing over to a stateless provider replays the full conversation seamlessly.
     /// </summary>
+    /// <remarks>
+    /// Opt-in contract: setting this flag asserts the endpoint's <c>IChatClient</c> behaves as
+    /// follows — (1) a successful response carries a non-null <c>ChatResponse.ConversationId</c>
+    /// naming server state that includes all input messages of that call plus the generated
+    /// response messages; (2) a request sending that id plus only newer messages continues the
+    /// same context; (3) ids are opaque and never required to repeat across turns (the router
+    /// always stores the latest). Trellis validates its sync logic against this contract, not
+    /// against any particular vendor — conformance is the adapter's responsibility.
+    /// </remarks>
     ServerConversationState = 8,
 }
 
