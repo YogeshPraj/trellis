@@ -2,9 +2,14 @@ using Microsoft.Extensions.AI;
 
 namespace Trellis.Tests;
 
-/// <summary>A canned-response IChatClient so agent tests run without a model provider.</summary>
-public sealed class FakeChatClient(string responseText) : IChatClient
+/// <summary>
+/// A canned-response IChatClient so agent tests run without a model provider. Give it a
+/// script of responses to serve in order; the last one repeats once the script runs out.
+/// </summary>
+public sealed class FakeChatClient(params string[] responses) : IChatClient
 {
+    private int _served = -1;
+
     public List<IReadOnlyList<ChatMessage>> Requests { get; } = [];
 
     public List<ChatOptions?> Options { get; } = [];
@@ -16,7 +21,8 @@ public sealed class FakeChatClient(string responseText) : IChatClient
     {
         Requests.Add([.. messages]);
         Options.Add(options);
-        return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, responseText)));
+        int index = Math.Min(Interlocked.Increment(ref _served), responses.Length - 1);
+        return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, responses[index])));
     }
 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(

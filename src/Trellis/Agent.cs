@@ -17,6 +17,8 @@ public class Agent<TResult>
     private readonly string? _instructions;
     private readonly ChatOptions? _chatOptions;
     private readonly ConversationCompactor? _compactor;
+    private readonly IOutputValidator<TResult>? _outputValidator;
+    private readonly OutputRetryOptions? _outputRetry;
 
     /// <param name="client">The underlying chat client.</param>
     /// <param name="instructions">Optional system instructions prepended to every run.</param>
@@ -29,16 +31,28 @@ public class Agent<TResult>
     /// Optional hot/cold context management for conversation runs: when the hot history
     /// grows past its budget, old turns are summarized and archived automatically.
     /// </param>
+    /// <param name="outputValidator">
+    /// Optional semantic validation beyond deserialization; rejected outputs are fed back
+    /// to the model for correction (see <see cref="OutputRetryOptions"/>).
+    /// </param>
+    /// <param name="outputRetry">
+    /// Self-healing configuration. When null, typed outputs still self-heal with the
+    /// defaults (2 correction retries); use <c>MaxRetries = 0</c> to fail fast.
+    /// </param>
     public Agent(
         IChatClient client,
         string? instructions = null,
         IReadOnlyList<AITool>? tools = null,
         bool autoInvokeTools = true,
-        ConversationCompactor? compactor = null)
+        ConversationCompactor? compactor = null,
+        IOutputValidator<TResult>? outputValidator = null,
+        OutputRetryOptions? outputRetry = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         _instructions = instructions;
         _compactor = compactor;
+        _outputValidator = outputValidator;
+        _outputRetry = outputRetry;
 
         if (tools is { Count: > 0 })
         {
@@ -66,7 +80,8 @@ public class Agent<TResult>
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(messages);
-        return AgentRunner.RunAsync<TResult>(_client, _instructions, _chatOptions, messages, cancellationToken);
+        return AgentRunner.RunAsync(
+            _client, _instructions, _chatOptions, messages, _outputValidator, _outputRetry, cancellationToken);
     }
 
     /// <summary>
@@ -105,7 +120,7 @@ public class Agent<TResult>
         options.ConversationId = conversation.RoutingId;
 
         AgentRunResult<TResult> result = await AgentRunner
-            .RunAsync<TResult>(_client, _instructions, options, payload, cancellationToken)
+            .RunAsync(_client, _instructions, options, payload, _outputValidator, _outputRetry, cancellationToken)
             .ConfigureAwait(false);
         conversation.AddRange(result.Response.Messages);
 
@@ -127,8 +142,10 @@ public sealed class Agent : Agent<string>
         string? instructions = null,
         IReadOnlyList<AITool>? tools = null,
         bool autoInvokeTools = true,
-        ConversationCompactor? compactor = null)
-        : base(client, instructions, tools, autoInvokeTools, compactor)
+        ConversationCompactor? compactor = null,
+        IOutputValidator<string>? outputValidator = null,
+        OutputRetryOptions? outputRetry = null)
+        : base(client, instructions, tools, autoInvokeTools, compactor, outputValidator, outputRetry)
     {
     }
 }

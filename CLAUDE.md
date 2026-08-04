@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.8.0** (tagged; GitHub release with all nupkgs). 104 tests.
+- Current version: **0.9.0**. 118 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -36,7 +36,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 | Project | Purpose |
 |---|---|
-| `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), `Conversation` (canonical client-side history; hot/cold compaction via `ConversationCompactor`), `[Tool]` attribute, agent-as-node graph bridge |
+| `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), self-healing outputs (`IOutputValidator<TResult>` + `OutputRetryOptions`, on by default for typed results), `Conversation` (canonical client-side history; hot/cold compaction via `ConversationCompactor`), `[Tool]` attribute, agent-as-node graph bridge |
 | `src/Trellis.Graph` | Zero-AI-dependency graph runtime: `StateGraph<TState>`, conditional edges, `AddParallelNode`, streaming events, `InterruptBefore` human-in-the-loop, `ICheckpointer<TState>`, per-process ThreadId run guard |
 | `src/Trellis.Routing` | `ModelRouter : IChatClient` — priority tiers + circuit breaker. Strategies: `IFailureClassifier`, `IFailurePolicy`, `IEndpointHealthStore`, `IEndpointSelectionStrategy` (round-robin / lowest-latency EMA / lowest-cost). Capability filtering (`ModelCapabilities`), conversation sync (delta + provider id for server-state endpoints, full replay on failover) |
 | `src/Trellis.State` | `ISharedStateStore` cross-instance KV with atomic `IncrementAsync`/`AppendAsync`/`GetListAsync`; InMemory + `IDistributedCache` bridge (bridge is read-modify-write — single-writer only) |
@@ -57,6 +57,11 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
   failover WITHOUT cooldown; rate-limit / quota / timeout / 5xx → failover AND trip;
   unknown → propagate. Status codes in messages match as standalone tokens only.
 - Failure counting must stay atomic (`IEndpointHealthStore.RecordFailureAsync`).
+- **Self-healing retries live inside a single run**: failed attempts + correction messages
+  go into the run's payload only — a `Conversation` absorbs just the final accepted
+  response. (With `ServerConversationState` endpoints, a retried turn over-counts
+  `SyncedCount`, so the router's `SyncedCount <= full.Count` guard forces a full replay
+  next turn — self-correcting, never silently divergent.)
 - `Directory.Build.props` owns version + packaging; `TreatWarningsAsErrors` is on.
 
 ## Commands
@@ -69,8 +74,7 @@ git tag v0.X.0 && git push origin v0.X.0   # cut a release
 
 ## Open Roadmap (owner-approved direction: layers 4–5 of the vision — trust + ecosystem)
 
-- Self-healing structured outputs (validation-retry with error feedback) — top pick
-- MCP client support (ecosystem unlock)
+- MCP client support (ecosystem unlock) — top pick
 - OpenTelemetry GenAI spans + cost accounting; eval harness
 - `IConversationStore` (multi-instance hot conversation state; currently per-process)
 - Token-budget compaction thresholds; retrieval over the cold archive

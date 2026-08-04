@@ -11,6 +11,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 ## Features
 
 - 🎯 **Strongly-typed agent outputs** — ask for an `Agent<FlightResult>` and get a `FlightResult` back, not a string to parse. Structured JSON output and deserialization are handled for you.
+- 🩹 **Self-healing structured outputs** — when the model's JSON fails to parse or fails validation, the errors are fed back to the model as a correction and it retries (bounded) before a typed `OutputValidationException` surfaces. Add semantic rules via `IOutputValidator<TResult>`; a DataAnnotations validator is included.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
 - 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
@@ -79,6 +80,34 @@ var agent = new Agent<OrderServices, OrderSummary>(client,
 
 OrderSummary summary = (await agent.RunAsync(services, "summarize my orders")).Output;
 ```
+
+## Self-healing structured outputs
+
+Models sometimes return JSON that doesn't parse, or values that parse but are wrong. Instead of throwing on the first bad response, a typed agent feeds the exact error back to the model — alongside its own failed attempt — and lets it correct itself:
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+record Booking(
+    [property: Required] string Destination,
+    [property: Range(0, 10_000)] decimal Price);
+
+var agent = new Agent<Booking>(client,
+    instructions: "You book flights.",
+    outputValidator: new DataAnnotationsOutputValidator<Booking>(),  // or any IOutputValidator<Booking>
+    outputRetry: new OutputRetryOptions { MaxRetries = 2 });         // the defaults, shown explicitly
+
+Booking booking = (await agent.RunAsync("book me a flight to Pune")).Output;
+```
+
+How it behaves:
+
+- **On by default** for typed outputs: deserialization failures self-heal with up to 2 correction retries even if you configure nothing. `MaxRetries = 0` restores fail-fast.
+- **Semantic validation** goes through `IOutputValidator<TResult>` — return errors phrased for the model ("Price must be positive") and they become the correction prompt. `DataAnnotationsOutputValidator<TResult>` covers the declarative cases.
+- **Budget exhausted → typed failure**: an `OutputValidationException` carrying every attempt's raw text and errors, not a bare `JsonException` from deep inside serialization.
+- **Cost is visible and bounded**: each retry re-pays roughly the full request, and `result.Attempts` reports what a run actually used.
+- **Conversations stay clean**: retry traffic lives only inside the run — a `Conversation` absorbs the user turn and the final accepted answer, never the failed attempts or corrections.
+- The correction message's role and wording are configurable (`FeedbackRole`, `FeedbackFormatter`), and validators can be async (call a DB, an eval model, ...).
 
 ## Graph workflows
 
@@ -275,7 +304,7 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 
 Trellis is an abstraction layer over `IChatClient`. Its tests target the **contract**, never a vendor: provider wire-format correctness belongs to the adapter (OpenAI SDK, OllamaSharp, ...), and Trellis stays deliberately uncoupled from live vendor APIs.
 
-- ✅ **Contract behavior validated against a real model** (local Ollama): plain agent runs, **typed structured outputs**, **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
+- ✅ **Contract behavior validated against a real model** (local Ollama): plain agent runs, **typed structured outputs**, **self-healing validation retries**, **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
 - 📜 **`ServerConversationState` is an opt-in contract**: marking an endpoint with it asserts its `IChatClient` follows the documented `ConversationId` semantics (see the flag's XML docs). Trellis's sync logic is verified against that contract; conformance of a given adapter is the adapter's responsibility.
 - ⚠️ **Multi-instance notes**: router health state and conversation archives are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only); the live `Conversation` object and graph run-guard are per-process — use session affinity or persist/rehydrate conversations across instances.
 
@@ -297,6 +326,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] Latency (EMA) and cost-based tier selection strategies
 - [x] `Trellis.State` shared-state abstraction with in-memory, `IDistributedCache`, and Redis providers
 - [x] Hot/cold conversation context (rolling summary + verbatim archive)
+- [x] Self-healing structured outputs (validation-retry with error feedback)
 - [ ] Token-budget-based compaction thresholds (currently message-count based)
 - [ ] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs

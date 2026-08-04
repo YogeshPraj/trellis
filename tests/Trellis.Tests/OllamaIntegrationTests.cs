@@ -35,7 +35,8 @@ public class OllamaIntegrationTests
 
     /// <summary>
     /// Small models are nondeterministic; one retry keeps genuine wiring failures visible
-    /// while stopping single-sample flakes from failing the suite.
+    /// while stopping single-sample flakes from failing the suite. An exhausted self-healing
+    /// budget counts as a flake here too — the loop's mechanics are proven by unit tests.
     /// </summary>
     private static async Task WithRetryAsync(Func<Task> assertion)
     {
@@ -43,7 +44,7 @@ public class OllamaIntegrationTests
         {
             await assertion();
         }
-        catch (Xunit.Sdk.XunitException)
+        catch (Exception ex) when (ex is Xunit.Sdk.XunitException or OutputValidationException)
         {
             await assertion();
         }
@@ -109,6 +110,40 @@ public class OllamaIntegrationTests
                 "Call the get_secret_number tool and tell me the number it returns.");
             Assert.True(invoked, "the model never invoked the tool");
             Assert.Contains("73", result.Output);
+        });
+    }
+
+    private sealed record ColorAnswer(string Color);
+
+    private sealed class MustBeBlueValidator : IOutputValidator<ColorAnswer>
+    {
+        public ValueTask<OutputValidationResult> ValidateAsync(ColorAnswer output, CancellationToken cancellationToken = default)
+            => new(string.Equals(output.Color?.Trim(), "blue", StringComparison.OrdinalIgnoreCase)
+                ? OutputValidationResult.Success
+                : OutputValidationResult.Failure(
+                    $"'{output.Color}' is not acceptable. The color must be exactly the word: blue"));
+    }
+
+    [Fact]
+    public async Task RealModel_SelfHealing_CorrectsOutputFromValidatorFeedback()
+    {
+        if (!Available.Value)
+        {
+            return;
+        }
+
+        // The prompt steers the model away from the only answer the validator accepts, so
+        // the first attempt fails and success can only come from the corrective feedback.
+        var agent = new Agent<ColorAnswer>(NewClient(),
+            instructions: "Answer as JSON.",
+            outputValidator: new MustBeBlueValidator(),
+            outputRetry: new OutputRetryOptions { MaxRetries = 3 });
+
+        await WithRetryAsync(async () =>
+        {
+            AgentRunResult<ColorAnswer> result = await agent.RunAsync("Name a color other than blue.");
+            Assert.Equal("blue", result.Output.Color.Trim(), ignoreCase: true);
+            Assert.True(result.Attempts > 1, "expected the first answer to fail validation");
         });
     }
 
