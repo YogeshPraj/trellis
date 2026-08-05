@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
@@ -22,6 +23,33 @@ internal static class AgentRunner
     }
 
     public static async Task<AgentRunResult<TResult>> RunAsync<TResult>(
+        IChatClient client,
+        string? instructions,
+        ChatOptions? options,
+        IEnumerable<ChatMessage> messages,
+        IOutputValidator<TResult>? validator,
+        OutputRetryOptions? retryOptions,
+        CancellationToken cancellationToken)
+    {
+        using Activity? activity = AgentTelemetry.StartRun(typeof(TResult), options, streaming: false);
+        long startedAt = Stopwatch.GetTimestamp();
+        try
+        {
+            AgentRunResult<TResult> result = await RunCoreAsync(
+                client, instructions, options, messages, validator, retryOptions, cancellationToken)
+                .ConfigureAwait(false);
+            AgentTelemetry.RecordSuccess(
+                activity, result.Response, result.Attempts, Stopwatch.GetElapsedTime(startedAt));
+            return result;
+        }
+        catch (Exception ex)
+        {
+            AgentTelemetry.RecordFailure(activity, ex, Stopwatch.GetElapsedTime(startedAt));
+            throw;
+        }
+    }
+
+    private static async Task<AgentRunResult<TResult>> RunCoreAsync<TResult>(
         IChatClient client,
         string? instructions,
         ChatOptions? options,
@@ -65,6 +93,7 @@ internal static class AgentRunner
             var failure = new OutputFailure(attempt, materialized.Errors, response.Text);
             failures.Add(failure);
             lastResponse = response;
+            AgentTelemetry.RecordRejection(response.ModelId, materialized.Errors[0]);
 
             if (attempt < maxAttempts)
             {
@@ -88,7 +117,8 @@ internal static class AgentRunner
         IChatClient client,
         Func<CancellationToken, ValueTask<(List<ChatMessage> Payload, ChatOptions? Options)>> prepare,
         IOutputValidator<TResult>? validator,
-        Func<AgentRunResult<TResult>, ValueTask>? onCompleted = null) =>
+        Func<AgentRunResult<TResult>, ValueTask>? onCompleted = null,
+        ChatOptions? optionsHint = null) =>
         new(
             ct => StreamCoreAsync(client, prepare, ct),
             async (response, ct) =>
@@ -108,7 +138,8 @@ internal static class AgentRunner
                     await onCompleted(result).ConfigureAwait(false);
                 }
                 return result;
-            });
+            },
+            optionsHint);
 
     private static async IAsyncEnumerable<ChatResponseUpdate> StreamCoreAsync(
         IChatClient client,

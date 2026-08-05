@@ -12,9 +12,27 @@ public sealed class SqliteCheckpointerTests : IDisposable
     public void Dispose()
     {
         Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        if (File.Exists(_dbPath))
+
+        // Clearing the pool doesn't guarantee the OS handle is gone by the time we get here,
+        // and WAL mode leaves -wal/-shm sidecars. Retry briefly rather than failing the run
+        // on a cleanup race that says nothing about the code under test.
+        foreach (string path in new[] { _dbPath, _dbPath + "-wal", _dbPath + "-shm" })
         {
-            File.Delete(_dbPath);
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                    }
+                    break;
+                }
+                catch (IOException)
+                {
+                    Thread.Sleep(25);
+                }
+            }
         }
     }
 

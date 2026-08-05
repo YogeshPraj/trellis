@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Extensions.AI;
 
 namespace Trellis;
@@ -25,15 +26,18 @@ public sealed class AgentStream<TResult> : IAsyncEnumerable<ChatResponseUpdate>
 {
     private readonly Func<CancellationToken, IAsyncEnumerable<ChatResponseUpdate>> _source;
     private readonly Func<ChatResponse, CancellationToken, ValueTask<AgentRunResult<TResult>>> _complete;
+    private readonly ChatOptions? _optionsHint;
     private int _enumerated;
     private AgentRunResult<TResult>? _result;
 
     internal AgentStream(
         Func<CancellationToken, IAsyncEnumerable<ChatResponseUpdate>> source,
-        Func<ChatResponse, CancellationToken, ValueTask<AgentRunResult<TResult>>> complete)
+        Func<ChatResponse, CancellationToken, ValueTask<AgentRunResult<TResult>>> complete,
+        ChatOptions? optionsHint = null)
     {
         _source = source;
         _complete = complete;
+        _optionsHint = optionsHint;
     }
 
     /// <summary>Whether the stream finished and <see cref="Result"/> is available.</summary>
@@ -56,16 +60,47 @@ public sealed class AgentStream<TResult> : IAsyncEnumerable<ChatResponseUpdate>
                 "An agent stream can be enumerated only once. Buffer the updates if you need them twice.");
         }
 
+        // The span must cover the whole enumeration, and a stream can be abandoned or throw:
+        // 'using' (a try/finally) is legal around a yield, so the activity is always stopped.
+        // The inner enumerator is driven by hand because a try/catch may not wrap a yield.
+        using Activity? activity = AgentTelemetry.StartRun(typeof(TResult), _optionsHint, streaming: true);
+        long startedAt = Stopwatch.GetTimestamp();
+
         List<ChatResponseUpdate> updates = [];
-        await foreach (ChatResponseUpdate update in _source(cancellationToken)
-            .WithCancellation(cancellationToken)
-            .ConfigureAwait(false))
+        await using IAsyncEnumerator<ChatResponseUpdate> source =
+            _source(cancellationToken).GetAsyncEnumerator(cancellationToken);
+        while (true)
         {
+            ChatResponseUpdate update;
+            try
+            {
+                if (!await source.MoveNextAsync().ConfigureAwait(false))
+                {
+                    break;
+                }
+                update = source.Current;
+            }
+            catch (Exception ex)
+            {
+                AgentTelemetry.RecordFailure(activity, ex, Stopwatch.GetElapsedTime(startedAt));
+                throw;
+            }
+
             updates.Add(update);
             yield return update;
         }
 
-        _result = await _complete(updates.ToChatResponse(), cancellationToken).ConfigureAwait(false);
+        ChatResponse response = updates.ToChatResponse();
+        try
+        {
+            _result = await _complete(response, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AgentTelemetry.RecordFailure(activity, ex, Stopwatch.GetElapsedTime(startedAt));
+            throw;
+        }
+        AgentTelemetry.RecordSuccess(activity, response, _result.Attempts, Stopwatch.GetElapsedTime(startedAt));
     }
 
     /// <summary>

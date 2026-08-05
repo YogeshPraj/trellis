@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 
@@ -126,6 +127,13 @@ public sealed class CompiledGraph<TState>
         string threadId,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        // Stopped by 'using' however the enumeration ends — completion, interrupt, or an
+        // exception thrown out of a node. Node spans take its context as an explicit parent
+        // rather than relying on Activity.Current, which a slow consumer could displace
+        // between yields.
+        using Activity? runActivity = GraphTelemetry.StartRun(threadId);
+        ActivityContext runContext = runActivity?.Context ?? default;
+
         int maxSteps = options?.MaxSteps ?? GraphRunOptions.DefaultMaxSteps;
         IReadOnlyCollection<string>? interruptBefore = options?.InterruptBefore;
         TState state = input;
@@ -191,7 +199,8 @@ public sealed class CompiledGraph<TState>
             int attempt = 1;
             while (true)
             {
-                NodeAttempt outcome = await TryRunAsync(() => handler(state, cancellationToken)).ConfigureAwait(false);
+                NodeAttempt outcome = await TryRunAsync(
+                    () => handler(state, cancellationToken), node, step, attempt, runContext).ConfigureAwait(false);
                 if (outcome.Error is null)
                 {
                     state = outcome.State!;
@@ -206,6 +215,7 @@ public sealed class CompiledGraph<TState>
 
                 if (decision.ShouldRetry)
                 {
+                    GraphTelemetry.RecordRetry(node);
                     yield return new GraphEvent<TState>(
                         GraphEventType.NodeRetrying, node, step, state, Attempt: attempt, Error: outcome.Error);
                     attempt++;
@@ -223,7 +233,9 @@ public sealed class CompiledGraph<TState>
                 }
 
                 NodeAttempt recovery = await TryRunAsync(
-                    () => fallback!(state, outcome.Error, cancellationToken)).ConfigureAwait(false);
+                    () => fallback!(state, outcome.Error, cancellationToken),
+                    $"{node} (fallback)", step, attempt, runContext).ConfigureAwait(false);
+                GraphTelemetry.RecordFallback(node, recovery.Error is null);
                 if (recovery.Error is not null)
                 {
                     // Surface both failures: the fallback's error alone hides why it ran.
@@ -267,15 +279,25 @@ public sealed class CompiledGraph<TState>
     private readonly record struct NodeAttempt(TState? State, Exception? Error);
 
     /// <summary>
-    /// Runs a node body and captures failure instead of throwing, so the caller — an
-    /// iterator that cannot <c>yield</c> from inside a <c>catch</c> — can emit retry events.
-    /// Cancellation is never captured: it means the caller gave up, not that the node failed.
+    /// Runs a node body under its own span and captures failure instead of throwing, so the
+    /// caller — an iterator that cannot <c>yield</c> from inside a <c>catch</c> — can emit
+    /// retry events. Cancellation is never captured: it means the caller gave up, not that
+    /// the node failed.
     /// </summary>
-    private static async Task<NodeAttempt> TryRunAsync(Func<Task<TState>> body)
+    private static async Task<NodeAttempt> TryRunAsync(
+        Func<Task<TState>> body,
+        string node,
+        int step,
+        int attempt,
+        ActivityContext parent)
     {
+        using Activity? activity = GraphTelemetry.StartNode(node, step, attempt, parent);
+        long startedAt = Stopwatch.GetTimestamp();
         try
         {
-            return new(await body().ConfigureAwait(false), null);
+            var result = new NodeAttempt(await body().ConfigureAwait(false), null);
+            GraphTelemetry.RecordNode(activity, node, Stopwatch.GetElapsedTime(startedAt), null);
+            return result;
         }
         catch (OperationCanceledException)
         {
@@ -283,6 +305,7 @@ public sealed class CompiledGraph<TState>
         }
         catch (Exception ex)
         {
+            GraphTelemetry.RecordNode(activity, node, Stopwatch.GetElapsedTime(startedAt), ex);
             return new(default, ex);
         }
     }

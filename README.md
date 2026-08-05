@@ -34,6 +34,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🌀 **Loop protection** — a `MaxSteps` guard stops runaway cycles before they burn tokens.
 - 🔌 **Provider-agnostic** — anything with an `IChatClient` works; swap OpenAI for Ollama with one line.
 - 🗣️ **Multi-turn conversations** — pass full message histories, with system instructions prepended automatically.
+- 📊 **OpenTelemetry + cost accounting** — agent runs and graph nodes emit spans and metrics through plain `ActivitySource`/`Meter` (no SDK dependency), following the GenAI semantic conventions. Plug in a price list and every run reports what it cost.
 - 🧪 **Testable by design** — the whole test suite runs against a fake `IChatClient`; no API keys, no network.
 - 🧩 **Zero-AI graph core** — `Trellis.Graph` has no AI dependency at all; use it to orchestrate any workflow, agentic or not.
 
@@ -335,6 +336,39 @@ The token trigger prefers **the provider's own reported input tokens** for the p
 
 What the model sees each turn: your instructions → *"Summary of the earlier conversation: ..."* → the hot tail. Each compaction bumps the conversation's `ContextEpoch`, which changes its routing id — so a conversation-aware router discards provider-side deltas and replays the compacted history in full (a server-side delta against the pre-compaction transcript would be wrong). The archive reuses `ISharedStateStore`, so cold context can live in memory, Redis, or any `IDistributedCache` backend.
 
+## Observability & cost
+
+Trellis instruments the layer that provider-level tracing can't see: a whole **agent run** (self-healing retries included) and **graph orchestration** (one span per node execution). It uses only `System.Diagnostics` primitives, so there's no OpenTelemetry SDK dependency — subscribe by name:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t => t.AddSource(AgentTelemetry.ActivitySourceName)   // "Trellis.Agent"
+                       .AddSource(GraphTelemetry.ActivitySourceName))  // "Trellis.Graph"
+    .WithMetrics(m => m.AddMeter(AgentTelemetry.MeterName)
+                       .AddMeter(GraphTelemetry.MeterName));
+```
+
+It deliberately does **not** instrument the chat call itself — `Microsoft.Extensions.AI`'s `UseOpenTelemetry()` already does, and duplicating it would double-count tokens. Compose both for the full picture.
+
+| Signal | What it tells you |
+|---|---|
+| `invoke_agent` span | One agent run: result type, model, token usage, `trellis.agent.attempts` (>1 means self-healing kicked in), error status |
+| `graph.run` / `graph.node {name}` spans | Orchestration shape; a **retried node produces one span per attempt**, so retries are visible instead of just looking slow |
+| `trellis.agent.output.rejections` | How often the model's output fails validation — the metric that tells you a prompt or schema needs work |
+| `trellis.graph.node.retries` / `.fallbacks` | Which nodes are unstable, and which are running degraded |
+| `gen_ai.client.token.usage`, `trellis.agent.cost` | Tokens by type, and spend when a cost model is configured |
+
+Cost accounting is opt-in, because token prices change and vary per contract — Trellis ships no price list it would be wrong about:
+
+```csharp
+AgentTelemetry.CostModel = new StaticTokenCostModel(new Dictionary<string, ModelPrice>
+{
+    ["gpt-4o"] = new(InputPerMillion: 2.50m, OutputPerMillion: 10.00m),
+});
+```
+
+An unknown model prices as `null`, never `0` — a dashboard can then distinguish "not priced" from "free". With nothing listening, instrumentation costs a null check per run.
+
 ## Packages
 
 | Package | What's in it |
@@ -383,7 +417,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] Self-healing structured outputs (validation-retry with error feedback)
 - [x] Token-budget-based compaction thresholds (`ITokenCounter` + provider-reported usage)
 - [x] Streaming agent responses (token-by-token)
-- [ ] OpenTelemetry instrumentation for agents and graph runs
+- [x] OpenTelemetry instrumentation for agents and graph runs (+ cost accounting)
 - [x] Retry/fallback policies per node (`INodeRetryPolicy` + `NodeResilience<TState>`)
 - [ ] Postgres checkpointer
 
