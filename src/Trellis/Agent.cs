@@ -85,6 +85,88 @@ public class Agent<TResult>
     }
 
     /// <summary>
+    /// Runs the agent with a single user prompt, streaming updates as they arrive.
+    /// Enumerate the returned <see cref="AgentStream{TResult}"/> for token-by-token output,
+    /// then read its <see cref="AgentStream{TResult}.Result"/> for the typed value.
+    /// </summary>
+    public AgentStream<TResult> RunStreamingAsync(string prompt, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(prompt);
+        return RunStreamingAsync([new ChatMessage(ChatRole.User, prompt)], cancellationToken);
+    }
+
+    /// <summary>Runs the agent with a full message history, streaming updates as they arrive.</summary>
+    public AgentStream<TResult> RunStreamingAsync(
+        IEnumerable<ChatMessage> messages,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        return AgentRunner.Stream(
+            _client,
+            _ => new((
+                AgentRunner.BuildPayload(_instructions, messages),
+                AgentRunner.WithStructuredOutputFormat<TResult>(_chatOptions))),
+            _outputValidator);
+    }
+
+    /// <summary>
+    /// Streams one turn of an ongoing <see cref="Conversation"/>. The conversation is
+    /// mutated lazily: the user prompt is appended when enumeration starts and the
+    /// assembled response is folded in when it completes, so a stream that is never
+    /// enumerated — or is abandoned mid-flight — leaves no half-turn behind.
+    /// </summary>
+    public AgentStream<TResult> RunStreamingAsync(
+        Conversation conversation,
+        string prompt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(conversation);
+        ArgumentNullException.ThrowIfNull(prompt);
+
+        return AgentRunner.Stream(
+            _client,
+            async ct =>
+            {
+                if (conversation.PendingCompaction is Task pending)
+                {
+                    await pending.ConfigureAwait(false);
+                    conversation.PendingCompaction = null;
+                }
+                conversation.Add(new ChatMessage(ChatRole.User, prompt));
+
+                ChatOptions options = AgentRunner.WithStructuredOutputFormat<TResult>(_chatOptions)
+                    ?? new ChatOptions();
+                options.ConversationId = conversation.RoutingId;
+                return (AgentRunner.BuildPayload(_instructions, BuildConversationPayload(conversation)), options);
+            },
+            _outputValidator,
+            result =>
+            {
+                conversation.AddRange(result.Response.Messages);
+                if (_compactor is not null)
+                {
+                    conversation.PendingCompaction =
+                        _compactor.CompactIfNeededAsync(conversation, CancellationToken.None);
+                }
+                return ValueTask.CompletedTask;
+            });
+    }
+
+    /// <summary>The rolling summary (when the conversation has been compacted) plus the hot history.</summary>
+    private static List<ChatMessage> BuildConversationPayload(Conversation conversation)
+    {
+        List<ChatMessage> payload = [];
+        if (conversation.Summary is string summary)
+        {
+            payload.Add(new ChatMessage(
+                ChatRole.System,
+                $"Summary of the earlier conversation (older turns were archived): {summary}"));
+        }
+        payload.AddRange(conversation.Messages);
+        return payload;
+    }
+
+    /// <summary>
     /// Runs one turn of an ongoing <see cref="Conversation"/>: appends the user prompt,
     /// sends the hot history plus the rolling summary of any compacted cold context
     /// (tagged with the conversation's routing id for conversation-aware routers), and
@@ -107,14 +189,7 @@ public class Agent<TResult>
         }
         conversation.Add(new ChatMessage(ChatRole.User, prompt));
 
-        List<ChatMessage> payload = [];
-        if (conversation.Summary is string summary)
-        {
-            payload.Add(new ChatMessage(
-                ChatRole.System,
-                $"Summary of the earlier conversation (older turns were archived): {summary}"));
-        }
-        payload.AddRange(conversation.Messages);
+        List<ChatMessage> payload = BuildConversationPayload(conversation);
 
         ChatOptions options = _chatOptions?.Clone() ?? new ChatOptions();
         options.ConversationId = conversation.RoutingId;

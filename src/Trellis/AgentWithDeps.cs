@@ -69,4 +69,34 @@ public class Agent<TDeps, TResult>
         return AgentRunner.RunAsync(
             _client, _instructions, options, messages, _outputValidator, _outputRetry, cancellationToken);
     }
+
+    /// <summary>Runs the agent with this run's dependencies, streaming updates as they arrive.</summary>
+    public AgentStream<TResult> RunStreamingAsync(
+        TDeps deps,
+        string prompt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(prompt);
+        return RunStreamingAsync(deps, [new ChatMessage(ChatRole.User, prompt)], cancellationToken);
+    }
+
+    /// <summary>Runs the agent with a full message history and this run's dependencies, streaming updates.</summary>
+    public AgentStream<TResult> RunStreamingAsync(
+        TDeps deps,
+        IEnumerable<ChatMessage> messages,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        return AgentRunner.Stream(
+            _client,
+            _ =>
+            {
+                // Tools are resolved lazily, at enumeration, so deps are read at run time.
+                var options = new ChatOptions { Tools = [.. _toolFactory(deps)] };
+                return new((
+                    AgentRunner.BuildPayload(_instructions, messages),
+                    AgentRunner.WithStructuredOutputFormat<TResult>(options)));
+            },
+            _outputValidator);
+    }
 }

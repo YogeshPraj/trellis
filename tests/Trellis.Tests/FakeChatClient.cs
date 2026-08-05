@@ -25,13 +25,25 @@ public sealed class FakeChatClient(params string[] responses) : IChatClient
         return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, responses[index])));
     }
 
+    /// <summary>
+    /// Streams the scripted response in whitespace-delimited chunks, so tests see genuine
+    /// multi-update assembly rather than a single-shot update that would hide ordering bugs.
+    /// </summary>
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
         IEnumerable<ChatMessage> messages,
         ChatOptions? options = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ChatResponse response = await GetResponseAsync(messages, options, cancellationToken);
-        yield return new ChatResponseUpdate(ChatRole.Assistant, response.Text);
+        string text = response.Text;
+        int start = 0;
+        while (start < text.Length)
+        {
+            int space = text.IndexOf(' ', start);
+            int end = space < 0 ? text.Length : space + 1;
+            yield return new ChatResponseUpdate(ChatRole.Assistant, text[start..end]);
+            start = end;
+        }
     }
 
     public object? GetService(Type serviceType, object? serviceKey = null) => null;

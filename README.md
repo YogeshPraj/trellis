@@ -12,6 +12,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 
 - 🎯 **Strongly-typed agent outputs** — ask for an `Agent<FlightResult>` and get a `FlightResult` back, not a string to parse. Structured JSON output and deserialization are handled for you.
 - 🩹 **Self-healing structured outputs** — when the model's JSON fails to parse or fails validation, the errors are fed back to the model as a correction and it retries (bounded) before a typed `OutputValidationException` surfaces. Add semantic rules via `IOutputValidator<TResult>`; a DataAnnotations validator is included.
+- 📶 **Streaming agent runs** — `RunStreamingAsync` yields token-by-token updates and, once the stream ends, hands you the same assembled, deserialized, validated `Result` the buffered call would have produced.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
 - 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
@@ -80,6 +81,23 @@ var agent = new Agent<OrderServices, OrderSummary>(client,
 
 OrderSummary summary = (await agent.RunAsync(services, "summarize my orders")).Output;
 ```
+
+## Streaming agent runs
+
+Stream tokens to a UI without giving up the typed result — enumerate for deltas, then read `Result`:
+
+```csharp
+AgentStream<FlightResult> run = agent.RunStreamingAsync("book me a flight to Pune");
+
+await foreach (string delta in run.TextDeltasAsync())
+    Console.Write(delta);                 // token-by-token, as the model produces it
+
+FlightResult flight = run.Result.Output;  // assembled, deserialized, validated
+```
+
+Conversations stream too, and stay canonical: `agent.RunStreamingAsync(conversation, "...")` appends the user turn when enumeration *starts* and folds the assembled reply in when it *finishes*, so a stream you never enumerate — or abandon halfway — never leaves a half-turn in the history.
+
+⚠️ **Streaming does not self-heal.** Validation can only run once the last token has arrived, and tokens already handed to the caller can't be retracted — so a rejected output throws `OutputValidationException` at the end of enumeration rather than silently streaming a second, contradictory answer. Use the buffered `RunAsync` when self-healing matters more than first-token latency. (One more caveat: streaming sets the JSON-schema response format directly, so a `TResult` whose schema root isn't an object — a bare `int` or array — is rejected by providers that require an object root. Wrap primitives in a record.)
 
 ## Self-healing structured outputs
 
@@ -304,7 +322,7 @@ Requires the .NET 10 SDK. No API keys needed for the test suite — agent tests 
 
 Trellis is an abstraction layer over `IChatClient`. Its tests target the **contract**, never a vendor: provider wire-format correctness belongs to the adapter (OpenAI SDK, OllamaSharp, ...), and Trellis stays deliberately uncoupled from live vendor APIs.
 
-- ✅ **Contract behavior validated against a real model** (local Ollama): plain agent runs, **typed structured outputs**, **self-healing validation retries**, **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
+- ✅ **Contract behavior validated against a real model** (local Ollama): plain agent runs, **typed structured outputs**, **self-healing validation retries**, **token-by-token streaming** (text and typed), **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
 - 📜 **`ServerConversationState` is an opt-in contract**: marking an endpoint with it asserts its `IChatClient` follows the documented `ConversationId` semantics (see the flag's XML docs). Trellis's sync logic is verified against that contract; conformance of a given adapter is the adapter's responsibility.
 - ⚠️ **Multi-instance notes**: router health state and conversation archives are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only); the live `Conversation` object and graph run-guard are per-process — use session affinity or persist/rehydrate conversations across instances.
 
@@ -328,7 +346,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] Hot/cold conversation context (rolling summary + verbatim archive)
 - [x] Self-healing structured outputs (validation-retry with error feedback)
 - [ ] Token-budget-based compaction thresholds (currently message-count based)
-- [ ] Streaming agent responses (token-by-token)
+- [x] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node
 - [ ] Postgres checkpointer

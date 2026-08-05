@@ -113,6 +113,50 @@ public class OllamaIntegrationTests
         });
     }
 
+    [Fact]
+    public async Task RealModel_StreamsTextIncrementally()
+    {
+        if (!Available.Value)
+        {
+            return;
+        }
+
+        var agent = new Agent(NewClient(), instructions: "Be brief.");
+
+        await WithRetryAsync(async () =>
+        {
+            AgentStream<string> stream = agent.RunStreamingAsync("Count from 1 to 10, separated by spaces.");
+            var chunks = new List<string>();
+            await foreach (string delta in stream.TextDeltasAsync())
+            {
+                chunks.Add(delta);
+            }
+
+            Assert.True(chunks.Count > 1, "the provider did not stream incrementally");
+            Assert.Equal(string.Concat(chunks), stream.Result.Output);
+        });
+    }
+
+    [Fact]
+    public async Task RealModel_StreamsTypedStructuredOutput()
+    {
+        if (!Available.Value)
+        {
+            return;
+        }
+
+        var agent = new Agent<MathAnswer>(NewClient(), instructions: "You compute sums and answer as JSON.");
+
+        await WithRetryAsync(async () =>
+        {
+            AgentStream<MathAnswer> stream = agent.RunStreamingAsync("What is 20 + 22?");
+            await foreach (ChatResponseUpdate _ in stream)
+            {
+            }
+            Assert.Equal(42, stream.Result.Output.Sum);
+        });
+    }
+
     private sealed record ColorAnswer(string Color);
 
     private sealed class MustBeBlueValidator : IOutputValidator<ColorAnswer>
