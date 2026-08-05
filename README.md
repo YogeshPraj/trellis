@@ -26,6 +26,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🌐 **Fleet-shared circuit state** — cooldown state flows through the `Trellis.State` abstraction (`ISharedStateStore`): in-memory by default, Redis via `Trellis.State.Redis`, or any `IDistributedCache` provider (SQL Server, Cosmos, Garnet) through the built-in bridge. One instance tripping a dead deployment protects the whole fleet.
 - ⚖️ **Latency & cost-aware selection** — order same-priority deployments by observed latency (EMA) or price per token instead of plain round-robin.
 - 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
+- 🗂️ **Multi-instance conversations** — `IConversationStore` persists live conversations (hot messages, rolling summary, epoch) so consecutive turns can land on different instances, with optimistic concurrency that refuses to silently clobber another instance's turn.
 - 🔥❄️ **Hot / cold context** — long conversations stay bounded: recent turns stay *hot* (verbatim in the prompt); older turns go *cold* — folded into a rolling summary by a cheap model and archived verbatim to any store. Context windows never overflow, token costs stay flat, nothing is lost.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
@@ -302,6 +303,25 @@ await agent.RunAsync(conversation, "What about hotels near the airport?");  // f
 
 Mark an endpoint with `ModelFeatures.ServerConversationState` and the router exploits it automatically: follow-up turns send only the unsynced messages plus the provider's own conversation id. The moment a request routes anywhere else — failover, load balancing, recovery — that endpoint receives the complete canonical history instead. Mid-conversation failover between providers is seamless, and your conversation is never trapped inside one vendor's API.
 
+### Conversations across instances
+
+A `Conversation` is a live in-memory object. Behind a load balancer, turn 2 may land on a different pod than turn 1 — so give it a store:
+
+```csharp
+var store = new SharedStateConversationStore(
+    new RedisSharedStateStore(mux),
+    timeToLive: TimeSpan.FromHours(12),   // abandoned sessions expire instead of accumulating
+    requireAtomicStore: true);            // refuse a backend that can't compare-and-swap
+
+Conversation conversation = await store.LoadAsync(sessionId) ?? new Conversation(sessionId);
+await agent.RunAsync(conversation, prompt);
+await store.SaveAsync(conversation);
+```
+
+Saves carry a version. If another instance advanced the conversation since this copy was loaded, `SaveAsync` throws `ConversationConcurrencyException` instead of overwriting that turn — reload and reapply, and if it happens often, add session affinity rather than retrying harder. On Redis the check is a real compare-and-swap (a Lua script, so the read and write can't interleave); on the `IDistributedCache` bridge, which has no CAS, the version check still catches the common case but a narrow race remains — `requireAtomicStore: true` rejects such a backend up front rather than letting you inherit silent last-write-wins.
+
+This complements the cold archive: `IConversationArchive` keeps compacted history, `IConversationStore` keeps the working conversation.
+
 ### Hot & cold context: conversations that never overflow
 
 A long-running conversation can't send its whole history forever. Give the agent a `ConversationCompactor` and the history is tiered automatically:
@@ -394,7 +414,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 
 - ✅ **Contract behavior validated against a real model** (local Ollama): plain agent runs, **typed structured outputs**, **self-healing validation retries**, **token-by-token streaming** (text and typed), **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
 - 📜 **`ServerConversationState` is an opt-in contract**: marking an endpoint with it asserts its `IChatClient` follows the documented `ConversationId` semantics (see the flag's XML docs). Trellis's sync logic is verified against that contract; conformance of a given adapter is the adapter's responsibility.
-- ⚠️ **Multi-instance notes**: router health state and conversation archives are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only); the live `Conversation` object and graph run-guard are per-process — use session affinity or persist/rehydrate conversations across instances.
+- ⚠️ **Multi-instance notes**: router health state, conversation archives, and the conversation store are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only). Conversations now persist and rehydrate through `IConversationStore` with optimistic concurrency; the graph run-guard remains per-process, so route a given thread id to one instance.
 
 ## Roadmap
 
@@ -419,6 +439,11 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] Streaming agent responses (token-by-token)
 - [x] OpenTelemetry instrumentation for agents and graph runs (+ cost accounting)
 - [x] Retry/fallback policies per node (`INodeRetryPolicy` + `NodeResilience<TState>`)
+- [x] `IConversationStore` — multi-instance hot conversation state with optimistic concurrency
+- [ ] MCP (Model Context Protocol) client support
+- [ ] Eval harness for agent outputs
+- [ ] Durable execution semantics (idempotency keys, deterministic replay)
+- [ ] Retrieval over the cold conversation archive
 - [ ] Postgres checkpointer
 
 ## License

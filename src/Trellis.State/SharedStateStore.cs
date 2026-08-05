@@ -45,11 +45,32 @@ public interface ISharedStateStore
 }
 
 /// <summary>
-/// In-process provider. Increments and appends are lock-protected (atomic within the
-/// process). Suitable for single-instance apps and tests; expired entries are purged on
-/// read and swept periodically on write so unread keys don't leak.
+/// Opt-in capability for providers that can compare-and-swap. Callers that need
+/// lost-update protection (see <c>SharedStateConversationStore</c>) test for this interface
+/// and degrade explicitly when it is absent, rather than silently assuming atomicity that
+/// a backend cannot deliver.
 /// </summary>
-public sealed class InMemorySharedStateStore(TimeProvider? timeProvider = null) : ISharedStateStore
+public interface IAtomicSharedStateStore : ISharedStateStore
+{
+    /// <summary>
+    /// Sets <paramref name="key"/> to <paramref name="newValue"/> only if its current value
+    /// is exactly <paramref name="expectedValue"/> (null meaning "the key must not exist"),
+    /// and reports whether the swap happened. Atomic across instances.
+    /// </summary>
+    ValueTask<bool> TrySetIfUnchangedAsync(
+        string key,
+        string? expectedValue,
+        string newValue,
+        TimeSpan? timeToLive = null,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// In-process provider. Increments, appends, and compare-and-swap are lock-protected
+/// (atomic within the process). Suitable for single-instance apps and tests; expired
+/// entries are purged on read and swept periodically on write so unread keys don't leak.
+/// </summary>
+public sealed class InMemorySharedStateStore(TimeProvider? timeProvider = null) : IAtomicSharedStateStore
 {
     private static readonly TimeSpan SweepInterval = TimeSpan.FromMinutes(1);
 
@@ -127,6 +148,33 @@ public sealed class InMemorySharedStateStore(TimeProvider? timeProvider = null) 
             }
         }
         return ValueTask.FromResult<IReadOnlyList<string>>([]);
+    }
+
+    /// <summary>Atomic within the process (shares the increment lock).</summary>
+    public ValueTask<bool> TrySetIfUnchangedAsync(
+        string key,
+        string? expectedValue,
+        string newValue,
+        TimeSpan? timeToLive = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        ArgumentNullException.ThrowIfNull(newValue);
+        lock (_incrementLock)
+        {
+            string? current = null;
+            if (_strings.TryGetValue(key, out (string Value, DateTimeOffset? ExpiresAt) entry)
+                && (entry.ExpiresAt is not DateTimeOffset expiry || expiry > _time.GetUtcNow()))
+            {
+                current = entry.Value;
+            }
+            if (current != expectedValue)
+            {
+                return ValueTask.FromResult(false);
+            }
+            _strings[key] = (newValue, timeToLive is TimeSpan ttl ? _time.GetUtcNow() + ttl : null);
+            return ValueTask.FromResult(true);
+        }
     }
 
     /// <summary>Purges expired string entries at most once per <see cref="SweepInterval"/>.</summary>

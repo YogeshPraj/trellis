@@ -129,6 +129,47 @@ public class RedisSharedStateStoreTests
 
         await db.Received(1).KeyDeleteAsync((RedisKey)"trellis:health:primary", Arg.Any<CommandFlags>());
     }
+
+    [Fact]
+    public async Task CompareAndSwap_RunsServerSide_AndPassesExpectedAndNewValues()
+    {
+        (RedisSharedStateStore store, IDatabase db) = NewStore();
+        db.ScriptEvaluateAsync(
+                Arg.Any<string>(), Arg.Any<RedisKey[]>(), Arg.Any<RedisValue[]>(), Arg.Any<CommandFlags>())
+            .Returns(Task.FromResult(RedisResult.Create((RedisValue)1)));
+
+        bool swapped = await store.TrySetIfUnchangedAsync("conversation:c1", "old", "new", TimeSpan.FromMinutes(5));
+
+        Assert.True(swapped);
+        await db.Received(1).ScriptEvaluateAsync(
+            Arg.Is<string>(script => script!.Contains("redis.call('GET'", StringComparison.Ordinal)),
+            Arg.Is<RedisKey[]>(keys => keys!.Single() == (RedisKey)"trellis:conversation:c1"),
+            Arg.Is<RedisValue[]>(values =>
+                values![0] == (RedisValue)"old"
+                && values[1] == (RedisValue)"new"
+                && values[2] == (RedisValue)"0"
+                && values[3] == (RedisValue)"300000"),
+            Arg.Any<CommandFlags>());
+    }
+
+    [Fact]
+    public async Task CompareAndSwap_SignalsExpectAbsent_AndReportsRefusal()
+    {
+        (RedisSharedStateStore store, IDatabase db) = NewStore();
+        db.ScriptEvaluateAsync(
+                Arg.Any<string>(), Arg.Any<RedisKey[]>(), Arg.Any<RedisValue[]>(), Arg.Any<CommandFlags>())
+            .Returns(Task.FromResult(RedisResult.Create((RedisValue)0)));
+
+        bool swapped = await store.TrySetIfUnchangedAsync("conversation:c1", expectedValue: null, "new");
+
+        Assert.False(swapped);
+        await db.Received(1).ScriptEvaluateAsync(
+            Arg.Any<string>(),
+            Arg.Any<RedisKey[]>(),
+            // ARGV[3] = "1" means "the key must not exist"; ARGV[4] = "" means no TTL.
+            Arg.Is<RedisValue[]>(values => values![2] == (RedisValue)"1" && values[3] == (RedisValue)string.Empty),
+            Arg.Any<CommandFlags>());
+    }
 }
 
 public class SharedHealthStoreFleetTests

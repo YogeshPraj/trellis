@@ -46,6 +46,13 @@ public sealed class Conversation
     /// </summary>
     public long? LastInputTokenCount { get; private set; }
 
+    /// <summary>
+    /// Version of this conversation in an <see cref="IConversationStore"/>: 0 until first
+    /// saved, then the version the store last wrote. Saving checks it, so a turn built on a
+    /// stale copy is rejected instead of silently overwriting another instance's turn.
+    /// </summary>
+    public int Version { get; private set; }
+
     /// <summary>Records provider-reported usage for the turn just completed.</summary>
     internal void RecordUsage(UsageDetails? usage)
     {
@@ -54,6 +61,29 @@ public sealed class Conversation
             LastInputTokenCount = input;
         }
     }
+
+    /// <summary>Rehydrates a conversation persisted by an <see cref="IConversationStore"/>.</summary>
+    internal static Conversation Restore(
+        string id,
+        IEnumerable<ChatMessage> messages,
+        string? summary,
+        int contextEpoch,
+        int archivedCount,
+        long? lastInputTokenCount,
+        int version)
+    {
+        var conversation = new Conversation(id);
+        conversation._messages.AddRange(messages);
+        conversation.Summary = summary;
+        conversation.ContextEpoch = contextEpoch;
+        conversation.ArchivedCount = archivedCount;
+        conversation.LastInputTokenCount = lastInputTokenCount;
+        conversation.Version = version;
+        return conversation;
+    }
+
+    /// <summary>Records that the store accepted a write at <paramref name="version"/>.</summary>
+    internal void MarkPersisted(int version) => Version = version;
 
     /// <summary>
     /// The id sent through <see cref="ChatOptions.ConversationId"/>. Includes the context
