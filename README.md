@@ -14,6 +14,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🩹 **Self-healing structured outputs** — when the model's JSON fails to parse or fails validation, the errors are fed back to the model as a correction and it retries (bounded) before a typed `OutputValidationException` surfaces. Add semantic rules via `IOutputValidator<TResult>`; a DataAnnotations validator is included.
 - 📶 **Streaming agent runs** — `RunStreamingAsync` yields token-by-token updates and, once the stream ends, hands you the same assembled, deserialized, validated `Result` the buffered call would have produced.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
+- 🔌 **MCP servers as tools** — `Trellis.Mcp` connects agents to Model Context Protocol servers over stdio or HTTP, aggregating several servers with collision-free naming, an allow-list, and failure isolation so one dead server degrades the agent instead of breaking it.
 - ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
 - 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
 - 🤝 **Agents as graph nodes** — `AddAgentNode(...)` drops any agent into a workflow: build the prompt from state, fold the typed result back in.
@@ -129,6 +130,33 @@ How it behaves:
 - **Cost is visible and bounded**: each retry re-pays roughly the full request, and `result.Attempts` reports what a run actually used.
 - **Conversations stay clean**: retry traffic lives only inside the run — a `Conversation` absorbs the user turn and the final accepted answer, never the failed attempts or corrections.
 - The correction message's role and wording are configurable (`FeedbackRole`, `FeedbackFormatter`), and validators can be async (call a DB, an eval model, ...).
+
+## MCP servers as tools
+
+`Trellis.Mcp` connects an agent to [Model Context Protocol](https://modelcontextprotocol.io) servers — GitHub, filesystems, databases, your own — and hands their tools to the model:
+
+```csharp
+using Trellis.Mcp;
+
+await using var github = McpServerToolSource.Stdio("github", "npx", ["-y", "@modelcontextprotocol/server-github"]);
+await using var docs   = McpServerToolSource.Http("docs", new Uri("https://internal/mcp"));
+
+var toolset = new McpToolset([github, docs], new McpToolsetOptions
+{
+    AllowedTools = ["create_issue", "search_docs"],   // allow-list anything you don't control
+});
+
+var agent = new Agent(client, instructions: "Use tools.", tools: await toolset.GetToolsAsync());
+```
+
+MCP tools already arrive as `AIFunction`s, so no adapter is needed to reach an agent. What Trellis adds is what a multi-server deployment actually needs:
+
+- **Collision-free naming** — tools are prefixed with their server (`github_create_issue`), which also tells the model which system a tool belongs to. Choose `McpToolNaming.Preserve` to keep the server's names, and a cross-server duplicate then fails fast instead of one server silently shadowing another.
+- **Failure isolation** — a server that's down is skipped (with a callback so a degraded agent is loud, not silent) rather than taking the whole agent with it. Set `OnServerUnavailable = Throw` for servers the agent is useless without.
+- **An allow-list** — a server can add tools at any time, and whatever it advertises becomes callable by your model. ⚠️ Treat third-party servers as untrusted: their tool descriptions enter your prompt and their tools run for real.
+- **Concurrent, deterministic loading** — servers are queried in parallel so a slow one doesn't serialize the rest, but the tool list is assembled in registration order. Listings are cached (5 min by default) so agent runs don't pay a round trip each time.
+
+Trellis's own logic sits behind `IMcpToolSource` and is unit-tested without a server; protocol conformance is the official MCP SDK's job. The adapter itself is validated against the real reference server (`@modelcontextprotocol/server-everything`) in `McpIntegrationTests`, which no-op when Node isn't installed.
 
 ## Graph workflows
 
@@ -399,6 +427,7 @@ An unknown model prices as `null`, never `0` — a dashboard can then distinguis
 | `Trellis.Routing` | `ModelRouter`: priority-based, capability-aware failover across model deployments with circuit-breaker cooldowns, automatic recovery, and portable conversation state |
 | `Trellis.State` | Cross-instance shared state: `ISharedStateStore` with in-memory and `IDistributedCache` providers |
 | `Trellis.State.Redis` | Redis provider for `Trellis.State` (StackExchange.Redis) |
+| `Trellis.Mcp` | MCP client support: connect agents to Model Context Protocol servers (stdio/HTTP) with multi-server aggregation, allow-listing, and failure isolation |
 
 ## Building
 
@@ -440,7 +469,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] OpenTelemetry instrumentation for agents and graph runs (+ cost accounting)
 - [x] Retry/fallback policies per node (`INodeRetryPolicy` + `NodeResilience<TState>`)
 - [x] `IConversationStore` — multi-instance hot conversation state with optimistic concurrency
-- [ ] MCP (Model Context Protocol) client support
+- [x] MCP (Model Context Protocol) client support (`Trellis.Mcp`)
 - [ ] Eval harness for agent outputs
 - [ ] Durable execution semantics (idempotency keys, deterministic replay)
 - [ ] Retrieval over the cold conversation archive

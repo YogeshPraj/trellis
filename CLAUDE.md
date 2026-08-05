@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.9.0**. 118 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.10.0**. 206 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -31,16 +31,20 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
    don't test against live vendor APIs. Real-model wiring validation uses **local Ollama**
    (`OllamaIntegrationTests`, model `qwen2.5:1.5b`; tests no-op when Ollama is down).
    Note: coder-tuned small models emit tool calls as plain text — useless for tool tests.
+   The same rule shapes MCP: Trellis logic sits behind `IMcpToolSource` and is unit-tested
+   with fakes; the SDK adapter is validated against the reference server in
+   `McpIntegrationTests` (`npx @modelcontextprotocol/server-everything`, no-ops without Node).
 
 ## Solution Layout (all net10.0 except the generator)
 
 | Project | Purpose |
 |---|---|
-| `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), self-healing outputs (`IOutputValidator<TResult>` + `OutputRetryOptions`, on by default for typed results), `Conversation` (canonical client-side history; hot/cold compaction via `ConversationCompactor`), `[Tool]` attribute, agent-as-node graph bridge |
-| `src/Trellis.Graph` | Zero-AI-dependency graph runtime: `StateGraph<TState>`, conditional edges, `AddParallelNode`, streaming events, `InterruptBefore` human-in-the-loop, `ICheckpointer<TState>`, per-process ThreadId run guard |
+| `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), self-healing outputs (`IOutputValidator<TResult>` + `OutputRetryOptions`, on by default for typed results), streaming (`RunStreamingAsync` → `AgentStream<TResult>`), `Conversation` (canonical client-side history; hot/cold compaction, message **and** token budgets via `ITokenCounter`), `IConversationStore` (multi-instance, optimistic concurrency), `AgentTelemetry` (spans/metrics/cost), `[Tool]` attribute, agent-as-node graph bridge |
+| `src/Trellis.Graph` | Zero-AI-dependency graph runtime: `StateGraph<TState>`, conditional edges, `AddParallelNode`, streaming events, `InterruptBefore` human-in-the-loop, `ICheckpointer<TState>`, per-node retry/fallback (`NodeResilience<TState>`), `GraphTelemetry`, per-process ThreadId run guard |
 | `src/Trellis.Routing` | `ModelRouter : IChatClient` — priority tiers + circuit breaker. Strategies: `IFailureClassifier`, `IFailurePolicy`, `IEndpointHealthStore`, `IEndpointSelectionStrategy` (round-robin / lowest-latency EMA / lowest-cost). Capability filtering (`ModelCapabilities`), conversation sync (delta + provider id for server-state endpoints, full replay on failover) |
-| `src/Trellis.State` | `ISharedStateStore` cross-instance KV with atomic `IncrementAsync`/`AppendAsync`/`GetListAsync`; InMemory + `IDistributedCache` bridge (bridge is read-modify-write — single-writer only) |
-| `src/Trellis.State.Redis` | Redis provider (StackExchange.Redis 3.x — `StringSetAsync` takes `Expiration`, not TimeSpan); INCR/RPUSH truly atomic |
+| `src/Trellis.State` | `ISharedStateStore` cross-instance KV with atomic `IncrementAsync`/`AppendAsync`/`GetListAsync`; opt-in `IAtomicSharedStateStore` (compare-and-swap); InMemory + `IDistributedCache` bridge (bridge is read-modify-write, no CAS — single-writer only) |
+| `src/Trellis.State.Redis` | Redis provider (StackExchange.Redis 3.x — `StringSetAsync` takes `Expiration`, not TimeSpan); INCR/RPUSH truly atomic; CAS via a Lua script |
+| `src/Trellis.Mcp` | MCP client support (ModelContextProtocol 2.x): `IMcpToolSource` + `McpToolset` (multi-server aggregation, server-name prefixing, allow-list, failure isolation) and the SDK-backed `McpServerToolSource` (stdio/HTTP, lazy connect, cached tool listings) |
 | `src/Trellis.Checkpointing.Sqlite` | Durable checkpointer: WAL, busy_timeout, per-thread retention (default 100). SQLitePCLRaw pinned ≥3.0.5 (CVE in the transitive default) |
 | `src/Trellis.Tools.Generator` | netstandard2.0 incremental source generator: `[Tool]` methods on partial classes → `CreateTools()`. Ships inside the `Trellis` package as an analyzer. Diagnostics TRL001–TRL003 |
 | `tests/Trellis.Tests` | xunit; fakes for unit coverage (`FakeChatClient`), NSubstitute for Redis, real-model `OllamaIntegrationTests` with one-retry flake tolerance |
@@ -62,6 +66,15 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
   response. (With `ServerConversationState` endpoints, a retried turn over-counts
   `SyncedCount`, so the router's `SyncedCount <= full.Count` guard forces a full replay
   next turn — self-correcting, never silently divergent.)
+- **Streaming never self-heals**: validation runs only after the last token and emitted
+  tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
+  Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **Graph retries are opt-in per node** (nodes are arbitrary user code with side effects),
+  never consume `MaxSteps`, never checkpoint a failed attempt, and never retry cancellation.
+- **Telemetry does not instrument the chat call** — M.E.AI's `UseOpenTelemetry()` owns that;
+  duplicating it would double-count tokens. Trellis spans cover agent runs and graph nodes.
+- Conversation saves are version-checked; a stale write raises
+  `ConversationConcurrencyException` rather than clobbering another instance's turn.
 - `Directory.Build.props` owns version + packaging; `TreatWarningsAsErrors` is on.
 
 ## Commands
@@ -74,8 +87,11 @@ git tag v0.X.0 && git push origin v0.X.0   # cut a release
 
 ## Open Roadmap (owner-approved direction: layers 4–5 of the vision — trust + ecosystem)
 
-- MCP client support (ecosystem unlock) — top pick
-- OpenTelemetry GenAI spans + cost accounting; eval harness
-- `IConversationStore` (multi-instance hot conversation state; currently per-process)
-- Token-budget compaction thresholds; retrieval over the cold archive
+Shipped in 0.10.0: streaming agents, token-budget compaction, per-node retry/fallback,
+OpenTelemetry + cost accounting, `IConversationStore`, MCP client support.
+
+- Eval harness for agent outputs (regression-test prompts/validators) — top pick
 - Durable execution semantics (idempotency keys, deterministic replay; Orleans/DTF)
+- Retrieval over the cold conversation archive
+- Postgres checkpointer
+- Cross-instance graph run leasing (the ThreadId guard is still per-process)

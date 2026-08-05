@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>MCP (Model Context Protocol) client support for Trellis: connect agents to MCP servers and expose their tools as typed agent tools, with multi-server aggregation, allow-listing, and failure isolation.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol" Version="2.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Trellis\Trellis.csproj" />
+  </ItemGroup>
+
+</Project>
