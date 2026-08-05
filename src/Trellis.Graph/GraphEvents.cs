@@ -8,6 +8,20 @@ public enum GraphEventType
     /// <summary>A node finished. <see cref="GraphEvent{TState}.State"/> is its output.</summary>
     NodeCompleted,
 
+    /// <summary>
+    /// A node attempt failed and will be retried (see <see cref="NodeResilience{TState}"/>).
+    /// <see cref="GraphEvent{TState}.Attempt"/> is the attempt that failed and
+    /// <see cref="GraphEvent{TState}.Error"/> is why; <see cref="GraphEvent{TState}.State"/>
+    /// is the input the retry will use.
+    /// </summary>
+    NodeRetrying,
+
+    /// <summary>
+    /// Every attempt failed and the node's fallback produced a state instead.
+    /// <see cref="GraphEvent{TState}.Error"/> is the failure it recovered from.
+    /// </summary>
+    NodeFallbackApplied,
+
     /// <summary>The graph reached <see cref="StateGraph.End"/>. <see cref="GraphEvent{TState}.State"/> is final.</summary>
     GraphCompleted,
 
@@ -25,12 +39,16 @@ public enum GraphEventType
 /// <param name="Step">Number of node executions completed so far.</param>
 /// <param name="State">The state at this point.</param>
 /// <param name="Next">For <see cref="GraphEventType.NodeCompleted"/>, where the graph goes next.</param>
+/// <param name="Attempt">Which attempt this concerns; 1 unless retries are in play.</param>
+/// <param name="Error">The failure behind a retry or fallback event; null otherwise.</param>
 public sealed record GraphEvent<TState>(
     GraphEventType Type,
     string? Node,
     int Step,
     TState State,
-    string? Next = null);
+    string? Next = null,
+    int Attempt = 1,
+    Exception? Error = null);
 
 /// <summary>How a graph run ended.</summary>
 public enum GraphRunStatus
@@ -80,7 +98,8 @@ public sealed class GraphRunOptions
 public sealed class GraphDefinitionException(string message) : Exception(message);
 
 /// <summary>The graph failed while executing.</summary>
-public class GraphExecutionException(string message) : Exception(message);
+public class GraphExecutionException(string message, Exception? innerException = null)
+    : Exception(message, innerException);
 
 /// <summary>The graph ran more steps than <see cref="GraphRunOptions.MaxSteps"/> allows.</summary>
 public sealed class GraphRecursionException(string message) : GraphExecutionException(message);

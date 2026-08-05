@@ -17,12 +17,13 @@ public static class StateGraph
 public sealed class StateGraph<TState>
 {
     private readonly Dictionary<string, NodeHandler<TState>> _nodes = [];
+    private readonly Dictionary<string, NodeResilience<TState>> _resilience = [];
     private readonly Dictionary<string, Func<TState, string>> _routers = [];
     private readonly Dictionary<string, string> _fixedEdges = [];
     private string? _entryPoint;
 
-    /// <summary>Adds an async node.</summary>
-    public StateGraph<TState> AddNode(string name, NodeHandler<TState> handler)
+    /// <summary>Adds an async node, optionally with retry/fallback handling.</summary>
+    public StateGraph<TState> AddNode(string name, NodeHandler<TState> handler, NodeResilience<TState>? resilience = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(handler);
@@ -34,31 +35,40 @@ public sealed class StateGraph<TState>
         {
             throw new GraphDefinitionException($"A node named '{name}' has already been added.");
         }
+        if (resilience is not null)
+        {
+            _resilience[name] = resilience;
+        }
         return this;
     }
 
-    /// <summary>Adds a synchronous node.</summary>
-    public StateGraph<TState> AddNode(string name, Func<TState, TState> handler)
+    /// <summary>Adds a synchronous node, optionally with retry/fallback handling.</summary>
+    public StateGraph<TState> AddNode(string name, Func<TState, TState> handler, NodeResilience<TState>? resilience = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
-        return AddNode(name, (state, _) => Task.FromResult(handler(state)));
+        return AddNode(name, (state, _) => Task.FromResult(handler(state)), resilience);
     }
 
     /// <summary>Adds an async node that does not need a cancellation token.</summary>
-    public StateGraph<TState> AddNode(string name, Func<TState, Task<TState>> handler)
+    public StateGraph<TState> AddNode(string name, Func<TState, Task<TState>> handler, NodeResilience<TState>? resilience = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
-        return AddNode(name, (state, _) => handler(state));
+        return AddNode(name, (state, _) => handler(state), resilience);
     }
 
     /// <summary>
     /// Adds a fan-out/fan-in node: every branch runs concurrently against the same input state,
     /// then <paramref name="merge"/> combines the input state and all branch results into one state.
     /// </summary>
+    /// <remarks>
+    /// Resilience applies to the node as a whole: a retry re-runs <em>every</em> branch, not
+    /// just the one that failed.
+    /// </remarks>
     public StateGraph<TState> AddParallelNode(
         string name,
         IReadOnlyList<NodeHandler<TState>> branches,
-        Func<TState, IReadOnlyList<TState>, TState> merge)
+        Func<TState, IReadOnlyList<TState>, TState> merge,
+        NodeResilience<TState>? resilience = null)
     {
         ArgumentNullException.ThrowIfNull(branches);
         ArgumentNullException.ThrowIfNull(merge);
@@ -71,20 +81,22 @@ public sealed class StateGraph<TState>
         {
             TState[] results = await Task.WhenAll(branches.Select(b => b(state, ct))).ConfigureAwait(false);
             return merge(state, results);
-        });
+        }, resilience);
     }
 
     /// <summary>Adds a fan-out/fan-in node whose branches do not need a cancellation token.</summary>
     public StateGraph<TState> AddParallelNode(
         string name,
         IReadOnlyList<Func<TState, Task<TState>>> branches,
-        Func<TState, IReadOnlyList<TState>, TState> merge)
+        Func<TState, IReadOnlyList<TState>, TState> merge,
+        NodeResilience<TState>? resilience = null)
     {
         ArgumentNullException.ThrowIfNull(branches);
         return AddParallelNode(
             name,
             [.. branches.Select(b => new NodeHandler<TState>((state, _) => b(state)))],
-            merge);
+            merge,
+            resilience);
     }
 
     /// <summary>Adds a fixed edge: after <paramref name="from"/> completes, run <paramref name="to"/>.</summary>
@@ -155,6 +167,7 @@ public sealed class StateGraph<TState>
         return new CompiledGraph<TState>(
             new Dictionary<string, NodeHandler<TState>>(_nodes),
             new Dictionary<string, Func<TState, string>>(_routers),
+            new Dictionary<string, NodeResilience<TState>>(_resilience),
             _entryPoint,
             checkpointer);
     }

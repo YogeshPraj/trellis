@@ -30,6 +30,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
 - 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
+- 🔁 **Per-node retry & fallback** — give any node an `INodeRetryPolicy` (capped exponential backoff with jitter by default) and a fallback that turns a dead dependency into a degraded state instead of a dead workflow.
 - 🌀 **Loop protection** — a `MaxSteps` guard stops runaway cycles before they burn tokens.
 - 🔌 **Provider-agnostic** — anything with an `IChatClient` works; swap OpenAI for Ollama with one line.
 - 🗣️ **Multi-turn conversations** — pass full message histories, with system instructions prepended automatically.
@@ -177,6 +178,28 @@ var paused = await graph.RunAsync(initialState, options);          // Status: In
 await graph.UpdateStateAsync("wf-1", s => s with { Draft = editedDraft });
 var done = await graph.RunAsync(initialState, options);            // resumes → Completed
 ```
+
+### Per-node retry & fallback
+
+Nodes call flaky things. Give one a resilience policy and a transient failure stops being a dead workflow:
+
+```csharp
+.AddNode("enrich", EnrichFromApiAsync, new NodeResilience<OrderState>
+{
+    Retry = new ExponentialBackoffRetryPolicy(maxAttempts: 4, baseDelay: TimeSpan.FromMilliseconds(200),
+                                              shouldRetry: e => e is not ArgumentException),
+    Fallback = (state, error, ct) => Task.FromResult(state with { Enrichment = null, Degraded = true }),
+})
+```
+
+Retries are **off by default and opt-in per node** — a node is arbitrary code, and re-running one re-runs its side effects. Enable them on nodes you've made idempotent; the XML docs say so at the point of use.
+
+- Backoff doubles per attempt, clamps at `maxDelay`, and carries jitter so a fleet doesn't retry a shared dependency in lockstep.
+- `shouldRetry` filters out errors that will never succeed (bad input, auth), so you don't wait 4 times for a certain failure.
+- Retries don't consume `MaxSteps` (they're re-executions of one step) and don't write checkpoints — only the successful attempt does, so a resumed run never replays a failed one.
+- Cancellation is never retried; it means the caller gave up, not that the node failed.
+- When the fallback itself fails you get a `GraphExecutionException` holding **both** errors in an `AggregateException` — the fallback's error alone would hide why it ran.
+- `StreamAsync` emits `NodeRetrying` (with attempt number and error) and `NodeFallbackApplied`, so retries are visible to progress UIs and logs rather than hidden latency.
 
 ## Model failover & prioritization
 
@@ -361,7 +384,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] Token-budget-based compaction thresholds (`ITokenCounter` + provider-reported usage)
 - [x] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
-- [ ] Retry/fallback policies per node
+- [x] Retry/fallback policies per node (`INodeRetryPolicy` + `NodeResilience<TState>`)
 - [ ] Postgres checkpointer
 
 ## License

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 
 namespace Trellis.Graph;
 
@@ -15,17 +16,20 @@ public sealed class CompiledGraph<TState>
     private readonly ConcurrentDictionary<string, byte> _activeThreads = new();
     private readonly IReadOnlyDictionary<string, NodeHandler<TState>> _nodes;
     private readonly IReadOnlyDictionary<string, Func<TState, string>> _routers;
+    private readonly IReadOnlyDictionary<string, NodeResilience<TState>> _resilience;
     private readonly string _entryPoint;
     private readonly ICheckpointer<TState>? _checkpointer;
 
     internal CompiledGraph(
         IReadOnlyDictionary<string, NodeHandler<TState>> nodes,
         IReadOnlyDictionary<string, Func<TState, string>> routers,
+        IReadOnlyDictionary<string, NodeResilience<TState>> resilience,
         string entryPoint,
         ICheckpointer<TState>? checkpointer)
     {
         _nodes = nodes;
         _routers = routers;
+        _resilience = resilience;
         _entryPoint = entryPoint;
         _checkpointer = checkpointer;
     }
@@ -183,7 +187,56 @@ public sealed class CompiledGraph<TState>
 
             yield return new GraphEvent<TState>(GraphEventType.NodeStarted, node, step, state);
 
-            state = await handler(state, cancellationToken).ConfigureAwait(false);
+            _resilience.TryGetValue(node, out NodeResilience<TState>? resilience);
+            int attempt = 1;
+            while (true)
+            {
+                NodeAttempt outcome = await TryRunAsync(() => handler(state, cancellationToken)).ConfigureAwait(false);
+                if (outcome.Error is null)
+                {
+                    state = outcome.State!;
+                    break;
+                }
+
+                NodeRetryDecision decision = resilience?.Retry is INodeRetryPolicy policy
+                    ? await policy
+                        .EvaluateAsync(new NodeFailureContext(node, attempt, outcome.Error), cancellationToken)
+                        .ConfigureAwait(false)
+                    : NodeRetryDecision.Stop;
+
+                if (decision.ShouldRetry)
+                {
+                    yield return new GraphEvent<TState>(
+                        GraphEventType.NodeRetrying, node, step, state, Attempt: attempt, Error: outcome.Error);
+                    attempt++;
+                    if (decision.Delay > TimeSpan.Zero)
+                    {
+                        await Task.Delay(decision.Delay, cancellationToken).ConfigureAwait(false);
+                    }
+                    continue;
+                }
+
+                NodeFallback<TState>? fallback = resilience?.Fallback;
+                if (fallback is null)
+                {
+                    ExceptionDispatchInfo.Throw(outcome.Error);
+                }
+
+                NodeAttempt recovery = await TryRunAsync(
+                    () => fallback!(state, outcome.Error, cancellationToken)).ConfigureAwait(false);
+                if (recovery.Error is not null)
+                {
+                    // Surface both failures: the fallback's error alone hides why it ran.
+                    throw new GraphExecutionException(
+                        $"Node '{node}' failed after {attempt} attempt(s) and its fallback also failed.",
+                        new AggregateException(outcome.Error, recovery.Error));
+                }
+
+                yield return new GraphEvent<TState>(
+                    GraphEventType.NodeFallbackApplied, node, step, recovery.State!, Attempt: attempt, Error: outcome.Error);
+                state = recovery.State!;
+                break;
+            }
             step++;
 
             string next = _routers.TryGetValue(node, out Func<TState, string>? router)
@@ -208,6 +261,30 @@ public sealed class CompiledGraph<TState>
         }
 
         yield return new GraphEvent<TState>(GraphEventType.GraphCompleted, null, step, state);
+    }
+
+    /// <summary>One node (or fallback) execution: the new state, or the exception it threw.</summary>
+    private readonly record struct NodeAttempt(TState? State, Exception? Error);
+
+    /// <summary>
+    /// Runs a node body and captures failure instead of throwing, so the caller — an
+    /// iterator that cannot <c>yield</c> from inside a <c>catch</c> — can emit retry events.
+    /// Cancellation is never captured: it means the caller gave up, not that the node failed.
+    /// </summary>
+    private static async Task<NodeAttempt> TryRunAsync(Func<Task<TState>> body)
+    {
+        try
+        {
+            return new(await body().ConfigureAwait(false), null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new(default, ex);
+        }
     }
 
     private static string NewThreadId() => Guid.NewGuid().ToString("N");
