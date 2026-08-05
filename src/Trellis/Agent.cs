@@ -143,6 +143,7 @@ public class Agent<TResult>
             result =>
             {
                 conversation.AddRange(result.Response.Messages);
+                conversation.RecordUsage(result.Response.Usage);
                 if (_compactor is not null)
                 {
                     conversation.PendingCompaction =
@@ -198,6 +199,7 @@ public class Agent<TResult>
             .RunAsync(_client, _instructions, options, payload, _outputValidator, _outputRetry, cancellationToken)
             .ConfigureAwait(false);
         conversation.AddRange(result.Response.Messages);
+        conversation.RecordUsage(result.Response.Usage);
 
         // Kick off compaction for the NEXT turn without blocking this one. CompactIfNeededAsync
         // never throws (failures invoke OnCompactionFailure), so the pending task is safe to await.

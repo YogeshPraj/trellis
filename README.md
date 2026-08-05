@@ -297,6 +297,19 @@ var agent = new Agent(router, instructions: "You are a travel assistant.", compa
 await agent.RunAsync(conversation, "so which hotel did we settle on again?");
 ```
 
+Budgets come in two flavours, and whichever trips first wins:
+
+```csharp
+new CompactionOptions
+{
+    MaxHotMessages = 40, KeepRecentMessages = 12,   // message count: predictable, free
+    MaxHotTokens = 8_000, KeepRecentTokens = 2_500, // tokens: what windows and bills are denominated in
+    TokenCounter = new HeuristicTokenCounter(),     // or wrap a real tokenizer via ITokenCounter
+}
+```
+
+The token trigger prefers **the provider's own reported input tokens** for the previous turn over any estimate — exact, free, and it accounts for your instructions, the rolling summary, and images. Whatever that reported total exceeds what the counter can attribute to the hot messages is treated as fixed overhead and charged against the retained tail's allowance, so the budget still bites when history isn't what's blowing it. (If that overhead alone exceeds the budget, every turn compacts to the newest message and stays there — the budget is unreachable, and only raising it or shortening your instructions fixes it.) The rolling summary is itself capped, so it can't quietly re-inflate every prompt over weeks.
+
 What the model sees each turn: your instructions → *"Summary of the earlier conversation: ..."* → the hot tail. Each compaction bumps the conversation's `ContextEpoch`, which changes its routing id — so a conversation-aware router discards provider-side deltas and replays the compacted history in full (a server-side delta against the pre-compaction transcript would be wrong). The archive reuses `ISharedStateStore`, so cold context can live in memory, Redis, or any `IDistributedCache` backend.
 
 ## Packages
@@ -345,7 +358,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 - [x] `Trellis.State` shared-state abstraction with in-memory, `IDistributedCache`, and Redis providers
 - [x] Hot/cold conversation context (rolling summary + verbatim archive)
 - [x] Self-healing structured outputs (validation-retry with error feedback)
-- [ ] Token-budget-based compaction thresholds (currently message-count based)
+- [x] Token-budget-based compaction thresholds (`ITokenCounter` + provider-reported usage)
 - [x] Streaming agent responses (token-by-token)
 - [ ] OpenTelemetry instrumentation for agents and graph runs
 - [ ] Retry/fallback policies per node

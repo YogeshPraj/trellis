@@ -39,6 +39,23 @@ public sealed class Conversation
     public int ArchivedCount { get; private set; }
 
     /// <summary>
+    /// Input tokens the provider reported for the most recent turn, when it reported any.
+    /// This is the exact size of what was sent (instructions + rolling summary + hot history),
+    /// so <see cref="ConversationCompactor"/> prefers it over estimation when deciding whether
+    /// the token budget is blown. Null with providers that don't report usage.
+    /// </summary>
+    public long? LastInputTokenCount { get; private set; }
+
+    /// <summary>Records provider-reported usage for the turn just completed.</summary>
+    internal void RecordUsage(UsageDetails? usage)
+    {
+        if (usage?.InputTokenCount is long input)
+        {
+            LastInputTokenCount = input;
+        }
+    }
+
+    /// <summary>
     /// The id sent through <see cref="ChatOptions.ConversationId"/>. Includes the context
     /// epoch after a compaction, because a compacted history must be replayed in full —
     /// a server-side delta against the pre-compaction transcript would be wrong.
