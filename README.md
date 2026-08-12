@@ -25,7 +25,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🧭 **Capability-aware routing** — endpoints declare what they support (tools, vision, JSON output, context window); a request needing tools never gets sent to a model that can't call them.
 - 🩺 **Typed failure handling** — status-code-based classification with `Retry-After` support; context-window and content-policy failures fail over *without* penalizing a healthy endpoint. Every policy is an interface you can swap.
 - 🌐 **Fleet-shared circuit state** — cooldown state flows through the `Trellis.State` abstraction (`ISharedStateStore`): in-memory by default, Redis via `Trellis.State.Redis`, or any `IDistributedCache` provider (SQL Server, Cosmos, Garnet) through the built-in bridge. One instance tripping a dead deployment protects the whole fleet.
-- ⚖️ **Latency & cost-aware selection** — order same-priority deployments by observed latency (EMA) or price per token instead of plain round-robin.
+- ⚖️ **Five load-balancing strategies** — order same-priority deployments by round-robin, **weight** (smooth weighted round-robin for mixed PTU/pay-as-you-go capacity), observed **latency** (EMA), **cost** per token, or **least loaded** (live in-flight request count).
 - 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
 - 🗂️ **Multi-instance conversations** — `IConversationStore` persists live conversations (hot messages, rolling summary, epoch) so consecutive turns can land on different instances, with optimistic concurrency that refuses to silently clobber another instance's turn.
 - 🪜 **Tiered storage with write-through** — chain any number of backends (Redis → Cosmos → ...) so a backend outage degrades instead of losing conversations. Every healthy tier holds the same version, so failover finds warm data and failback can't silently revert.
@@ -274,7 +274,7 @@ The router is built from four pluggable strategies (each an interface with a sen
 | `IFailureClassifier` | *What went wrong* — typed `FailureKind` from status codes and messages, plus the provider's `Retry-After` when available | `DefaultFailureClassifier` |
 | `IFailurePolicy` | *What to do about it* — propagate, fail over + trip, or fail over only | `DefaultFailurePolicy` |
 | `IEndpointHealthStore` | *Where cooldown state lives* — `SharedStateEndpointHealthStore` adapts any `ISharedStateStore` backend so your whole fleet shares one view of which deployments are down | `InMemoryEndpointHealthStore` |
-| `IEndpointSelectionStrategy` | *How a priority tier is ordered* — round-robin, lowest observed latency, or lowest cost | `RoundRobinSelectionStrategy` |
+| `IEndpointSelectionStrategy` | *How a priority tier is ordered* — round-robin, weighted, lowest latency, lowest cost, or least loaded | `RoundRobinSelectionStrategy` |
 
 The failure policy distinguishes *provider* problems from *request* problems, LiteLLM-style:
 
@@ -282,7 +282,29 @@ The failure policy distinguishes *provider* problems from *request* problems, Li
 - **Context-window overflow / content-policy rejection** → fail over **without tripping** — the model is healthy, this request just doesn't fit it; a bigger-window or more permissive deployment gets it instead, and the endpoint stays in rotation for the next request.
 - **Unknown errors** → propagate immediately; they'd fail on every model anyway.
 
-When a provider says how long to back off (`Retry-After`), that exact duration is used instead of the exponential cooldown. Latency is tracked per endpoint (EMA), so `LowestLatencySelectionStrategy` routes to whatever is actually fastest right now, and `LowestCostSelectionStrategy` uses `ModelEndpoint.CostPerMillionTokens`.
+When a provider says how long to back off (`Retry-After`), that exact duration is used instead of the exponential cooldown.
+
+### Load balancing within a tier
+
+Priorities always win first; a selection strategy only arbitrates *within* one tier:
+
+| Strategy | Orders by | Use it when |
+|---|---|---|
+| `RoundRobinSelectionStrategy` *(default)* | rotation | deployments are interchangeable |
+| `WeightedSelectionStrategy` | `ModelEndpoint.Weight` | capacity differs — e.g. a PTU deployment beside pay-as-you-go |
+| `LowestLatencySelectionStrategy` | observed latency (EMA) | you want whatever is fastest right now |
+| `LowestCostSelectionStrategy` | `CostPerMillionTokens` | spend matters more than speed |
+| `LeastLoadedSelectionStrategy` | live in-flight requests | request costs vary wildly and latency averages mislead |
+
+```csharp
+new ModelEndpoint("azure-ptu",  ptuClient,  priority: 0) { Weight = 4 },   // 80% of the tier
+new ModelEndpoint("azure-payg", paygClient, priority: 0) { Weight = 1 },   // 20%
+// options: SelectionStrategy = new WeightedSelectionStrategy()
+```
+
+`WeightedSelectionStrategy` uses smooth weighted round-robin (nginx's algorithm), so weights 3:1 yield `A B A A` rather than clustering three A's together — the split holds over short bursts, not just in the long run. It's computed from the request counter rather than mutable state, so it stays deterministic and allocation-light.
+
+`LeastLoadedSelectionStrategy` counts requests actually outstanding, with a streaming response counted in flight until its last token. That's the strategy that measures congestion rather than inferring it — useful when a 200-token classification shares a tier with a 100k-token summarization. Counts are per-process, so it balances one instance's concurrency, not the fleet's.
 
 ### Sharing circuit state across your fleet
 

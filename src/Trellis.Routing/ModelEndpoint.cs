@@ -38,6 +38,22 @@ public sealed class ModelEndpoint
     /// Endpoints without a declared cost are considered most expensive.
     /// </summary>
     public double? CostPerMillionTokens { get; init; }
+
+    /// <summary>
+    /// Relative share of traffic within its priority tier, used by
+    /// <see cref="WeightedSelectionStrategy"/> (default 1 — an equal share). A deployment
+    /// with weight 3 receives three times the requests of one with weight 1.
+    /// Ignored by every other selection strategy.
+    /// </summary>
+    public int Weight
+    {
+        get => _weight;
+        init => _weight = value >= 1
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), "Weight must be at least 1.");
+    }
+
+    private readonly int _weight = 1;
 }
 
 /// <summary>What the router does when every endpoint is cooling down.</summary>

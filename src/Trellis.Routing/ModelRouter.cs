@@ -74,6 +74,7 @@ public sealed class ModelRouter : IChatClient
     private readonly TimeProvider _time;
     private readonly ConversationSyncManager _conversations = new();
     private readonly MetricsTracker _metrics = new();
+    private readonly InFlightTracker _inFlight = new();
     private int _rotation = -1;
 
     public ModelRouter(IReadOnlyList<ModelEndpoint> endpoints, ModelRouterOptions? options = null)
@@ -105,6 +106,9 @@ public sealed class ModelRouter : IChatClient
                 _conversations.Prepare(candidate.Endpoint, full, options, streaming: false);
 
             long started = _time.GetTimestamp();
+            // The lease makes this endpoint's load visible to LeastLoadedSelectionStrategy
+            // while the call is outstanding, and is released however the call ends.
+            using InFlightTracker.Lease lease = _inFlight.Acquire(candidate.Endpoint.Name);
             try
             {
                 ChatResponse response = await candidate.Endpoint.Client
@@ -152,6 +156,9 @@ public sealed class ModelRouter : IChatClient
             bool hasFirst;
             ChatResponseUpdate? first = null;
             long started = _time.GetTimestamp();
+            // A streaming call stays in flight until its last token, so this lease outlives
+            // the connect phase and is released in every exit below.
+            InFlightTracker.Lease lease = _inFlight.Acquire(candidate.Endpoint.Name);
             try
             {
                 stream = candidate.Endpoint.Client
@@ -165,6 +172,7 @@ public sealed class ModelRouter : IChatClient
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
+                lease.Dispose();
                 if (stream is not null)
                 {
                     await stream.DisposeAsync().ConfigureAwait(false);
@@ -173,6 +181,7 @@ public sealed class ModelRouter : IChatClient
             }
             catch (Exception ex)
             {
+                lease.Dispose();
                 if (stream is not null)
                 {
                     await stream.DisposeAsync().ConfigureAwait(false);
@@ -199,6 +208,7 @@ public sealed class ModelRouter : IChatClient
             }
             finally
             {
+                lease.Dispose();
                 await stream!.DisposeAsync().ConfigureAwait(false);
             }
             yield break;
@@ -303,7 +313,7 @@ public sealed class ModelRouter : IChatClient
             (health.UnavailableUntil <= now ? available : coolingDown).Add(new Candidate(endpoint, health));
         }
 
-        var context = new SelectionContext(Interlocked.Increment(ref _rotation), _metrics);
+        var context = new SelectionContext(Interlocked.Increment(ref _rotation), _metrics, _inFlight);
         List<Candidate> order = [];
         foreach (IGrouping<int, Candidate> tierGroup in available.GroupBy(c => c.Endpoint.Priority).OrderBy(g => g.Key))
         {
