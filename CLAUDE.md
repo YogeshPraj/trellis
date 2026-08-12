@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.10.0**. 215 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.10.0**. 229 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -44,6 +44,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 | `src/Trellis.Routing` | `ModelRouter : IChatClient` — priority tiers + circuit breaker. Strategies: `IFailureClassifier`, `IFailurePolicy`, `IEndpointHealthStore`, `IEndpointSelectionStrategy` (round-robin / lowest-latency EMA / lowest-cost). Capability filtering (`ModelCapabilities`), conversation sync (delta + provider id for server-state endpoints, full replay on failover) |
 | `src/Trellis.State` | `ISharedStateStore` cross-instance KV with atomic `IncrementAsync`/`AppendAsync`/`GetListAsync`; opt-in `IAtomicSharedStateStore` (compare-and-swap); InMemory + `IDistributedCache` bridge (bridge is read-modify-write, no CAS — single-writer only) |
 | `src/Trellis.State.Redis` | Redis provider (StackExchange.Redis 3.x — `StringSetAsync` takes `Expiration`, not TimeSpan); INCR/RPUSH truly atomic; CAS via a Lua script |
+| `src/Trellis.Azure.Cosmos` | Azure Cosmos DB provider for `ISharedStateStore` — ETag CAS, server-side Patch increments, one-document-per-entry lists. Container needs `/pk` partition key and `DefaultTimeToLive` for TTL. Documents are public (`CosmosStateDocument`) as they are the on-disk schema, and carry BOTH Newtonsoft and STJ attributes because the Cosmos SDK defaults to Newtonsoft |
 | `src/Trellis.Mcp` | MCP client support (ModelContextProtocol 2.x): `IMcpToolSource` + `McpToolset` (multi-server aggregation, server-name prefixing, allow-list, failure isolation) and the SDK-backed `McpServerToolSource` (stdio/HTTP, lazy connect, cached tool listings) |
 | `src/Trellis.Checkpointing.Sqlite` | Durable checkpointer: WAL, busy_timeout, per-thread retention (default 100). SQLitePCLRaw pinned ≥3.0.5 (CVE in the transitive default) |
 | `src/Trellis.Tools.Generator` | netstandard2.0 incremental source generator: `[Tool]` methods on partial classes → `CreateTools()`. Ships inside the `Trellis` package as an analyzer. Diagnostics TRL001–TRL003 |
@@ -81,6 +82,10 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
   write failure never fails the turn but MUST delete that tier's entry, and a recovering tier
   is excluded from reads until a write repairs the specific conversation. Tier health is
   per-process (documented limitation; bound it with per-tier TTLs).
+- **Cloud code is a leaf package, never a framework dependency.** Core stays cloud-neutral
+  (`Trellis.Graph` has zero deps). Naming: cloud-neutral tech is `Trellis.<Area>.<Tech>`
+  (`Trellis.State.Redis`), cloud-specific is `Trellis.<Cloud>.<Service>`
+  (`Trellis.Azure.Cosmos`; `Trellis.Aws.DynamoDb` would slot in identically).
 - `Directory.Build.props` owns version + packaging; `TreatWarningsAsErrors` is on.
 
 ## Commands

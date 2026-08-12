@@ -32,6 +32,7 @@
     <ProjectReference Include="..\..\src\Trellis.State\Trellis.State.csproj" />
     <ProjectReference Include="..\..\src\Trellis.State.Redis\Trellis.State.Redis.csproj" />
     <ProjectReference Include="..\..\src\Trellis.Mcp\Trellis.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\Trellis.Azure.Cosmos\Trellis.Azure.Cosmos.csproj" />
   </ItemGroup>
 
 </Project>

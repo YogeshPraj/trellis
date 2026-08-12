@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Trellis.Azure.Cosmos/Trellis.Azure.Cosmos.csproj" />
     <Project Path="src/Trellis.Checkpointing.Sqlite/Trellis.Checkpointing.Sqlite.csproj" />
     <Project Path="src/Trellis.Graph/Trellis.Graph.csproj" />
     <Project Path="src/Trellis.Mcp/Trellis.Mcp.csproj" />

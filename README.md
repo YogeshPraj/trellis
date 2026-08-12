@@ -460,7 +460,37 @@ An unknown model prices as `null`, never `0` — a dashboard can then distinguis
 | `Trellis.Routing` | `ModelRouter`: priority-based, capability-aware failover across model deployments with circuit-breaker cooldowns, automatic recovery, and portable conversation state |
 | `Trellis.State` | Cross-instance shared state: `ISharedStateStore` with in-memory and `IDistributedCache` providers |
 | `Trellis.State.Redis` | Redis provider for `Trellis.State` (StackExchange.Redis) |
+| `Trellis.Azure.Cosmos` | Azure Cosmos DB provider for `Trellis.State`: durable cross-instance storage with ETag-based compare-and-swap |
 | `Trellis.Mcp` | MCP client support: connect agents to Model Context Protocol servers (stdio/HTTP) with multi-server aggregation, allow-listing, and failure isolation |
+
+## Cloud providers, and swapping them
+
+The core is cloud-neutral by construction: `Trellis` depends only on `Microsoft.Extensions.AI`, `Trellis.Graph` on **nothing**, and every piece of infrastructure sits behind an interface — `ISharedStateStore`, `IConversationStore`, `IConversationArchive`, `ICheckpointer<TState>`, `IEndpointHealthStore`. A cloud is a leaf package, never a dependency of the framework.
+
+The naming rule follows that split:
+
+| Kind | Naming | Examples |
+|---|---|---|
+| Cloud-neutral technology | `Trellis.<Area>.<Tech>` | `Trellis.State.Redis` (Azure Cache, ElastiCache, or self-hosted), `Trellis.Checkpointing.Sqlite` |
+| Cloud-specific service | `Trellis.<Cloud>.<Service>` | `Trellis.Azure.Cosmos` — and `Trellis.Aws.DynamoDb` slots in the same way |
+
+So an Azure deployment and an AWS one differ by which leaf packages are referenced and a few lines of wiring, not by any change to agent, graph, or routing code:
+
+```csharp
+// Azure today
+ISharedStateStore durable = new CosmosSharedStateStore(cosmosContainer);
+
+// AWS tomorrow — same interface, same tiered store, same agents
+// ISharedStateStore durable = new DynamoDbSharedStateStore(dynamoClient, "trellis-state");
+
+IConversationStore store = new TieredConversationStore(
+[
+    new ConversationTier("redis", redis, TimeToLive: TimeSpan.FromHours(12)),
+    new ConversationTier("durable", durable),
+]);
+```
+
+`Trellis.Azure.Cosmos` implements `IAtomicSharedStateStore` using Cosmos **ETags**, so the tiered store's compare-and-swap is genuinely atomic across instances rather than emulated. Increments use the server-side Patch operation, and list appends write one document per entry so an archive isn't capped by the 2&nbsp;MB document limit. The container needs `/pk` as its partition key path, and `DefaultTimeToLive` set if you pass a TTL — the store throws rather than let Cosmos silently ignore expiry you asked for.
 
 ## Building
 
