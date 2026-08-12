@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.10.0**. 206 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.10.0**. 215 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -39,7 +39,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 | Project | Purpose |
 |---|---|
-| `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), self-healing outputs (`IOutputValidator<TResult>` + `OutputRetryOptions`, on by default for typed results), streaming (`RunStreamingAsync` → `AgentStream<TResult>`), `Conversation` (canonical client-side history; hot/cold compaction, message **and** token budgets via `ITokenCounter`), `IConversationStore` (multi-instance, optimistic concurrency), `AgentTelemetry` (spans/metrics/cost), `[Tool]` attribute, agent-as-node graph bridge |
+| `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), self-healing outputs (`IOutputValidator<TResult>` + `OutputRetryOptions`, on by default for typed results), streaming (`RunStreamingAsync` → `AgentStream<TResult>`), `Conversation` (canonical client-side history; hot/cold compaction, message **and** token budgets via `ITokenCounter`), `IConversationStore` (multi-instance, optimistic concurrency) + `TieredConversationStore` (write-through chain, per-tier circuit breaker), `AgentTelemetry` (spans/metrics/cost), `[Tool]` attribute, agent-as-node graph bridge |
 | `src/Trellis.Graph` | Zero-AI-dependency graph runtime: `StateGraph<TState>`, conditional edges, `AddParallelNode`, streaming events, `InterruptBefore` human-in-the-loop, `ICheckpointer<TState>`, per-node retry/fallback (`NodeResilience<TState>`), `GraphTelemetry`, per-process ThreadId run guard |
 | `src/Trellis.Routing` | `ModelRouter : IChatClient` — priority tiers + circuit breaker. Strategies: `IFailureClassifier`, `IFailurePolicy`, `IEndpointHealthStore`, `IEndpointSelectionStrategy` (round-robin / lowest-latency EMA / lowest-cost). Capability filtering (`ModelCapabilities`), conversation sync (delta + provider id for server-state endpoints, full replay on failover) |
 | `src/Trellis.State` | `ISharedStateStore` cross-instance KV with atomic `IncrementAsync`/`AppendAsync`/`GetListAsync`; opt-in `IAtomicSharedStateStore` (compare-and-swap); InMemory + `IDistributedCache` bridge (bridge is read-modify-write, no CAS — single-writer only) |
@@ -75,6 +75,12 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
   duplicating it would double-count tokens. Trellis spans cover agent runs and graph nodes.
 - Conversation saves are version-checked; a stale write raises
   `ConversationConcurrencyException` rather than clobbering another instance's turn.
+- **Tiered conversation storage is write-through, last tier authoritative.** A fallback that
+  was never written to is empty, so plain failover loses the conversation and failback
+  silently reverts it — write-through keeps every healthy tier on the same version. Replica
+  write failure never fails the turn but MUST delete that tier's entry, and a recovering tier
+  is excluded from reads until a write repairs the specific conversation. Tier health is
+  per-process (documented limitation; bound it with per-tier TTLs).
 - `Directory.Build.props` owns version + packaging; `TreatWarningsAsErrors` is on.
 
 ## Commands

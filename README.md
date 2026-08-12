@@ -28,6 +28,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - ⚖️ **Latency & cost-aware selection** — order same-priority deployments by observed latency (EMA) or price per token instead of plain round-robin.
 - 🧵 **Portable conversations** — `Conversation` keeps the canonical history client-side. Endpoints with server-side context (e.g. OpenAI's Responses API) transparently receive only the new messages plus their conversation id; failing over to a stateless provider replays the full history, so mid-conversation failover loses nothing.
 - 🗂️ **Multi-instance conversations** — `IConversationStore` persists live conversations (hot messages, rolling summary, epoch) so consecutive turns can land on different instances, with optimistic concurrency that refuses to silently clobber another instance's turn.
+- 🪜 **Tiered storage with write-through** — chain any number of backends (Redis → Cosmos → ...) so a backend outage degrades instead of losing conversations. Every healthy tier holds the same version, so failover finds warm data and failback can't silently revert.
 - 🔥❄️ **Hot / cold context** — long conversations stay bounded: recent turns stay *hot* (verbatim in the prompt); older turns go *cold* — folded into a rolling summary by a cheap model and archived verbatim to any store. Context windows never overflow, token costs stay flat, nothing is lost.
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
@@ -349,6 +350,38 @@ await store.SaveAsync(conversation);
 Saves carry a version. If another instance advanced the conversation since this copy was loaded, `SaveAsync` throws `ConversationConcurrencyException` instead of overwriting that turn — reload and reapply, and if it happens often, add session affinity rather than retrying harder. On Redis the check is a real compare-and-swap (a Lua script, so the read and write can't interleave); on the `IDistributedCache` bridge, which has no CAS, the version check still catches the common case but a narrow race remains — `requireAtomicStore: true` rejects such a backend up front rather than letting you inherit silent last-write-wins.
 
 This complements the cold archive: `IConversationArchive` keeps compacted history, `IConversationStore` keeps the working conversation.
+
+#### Surviving a backend outage: tiered write-through
+
+If losing conversations when Redis has a bad day isn't acceptable, chain storage tiers — fastest first, durable last — and every write goes through all of them:
+
+```csharp
+IConversationStore store = new TieredConversationStore(
+[
+    new ConversationTier("redis",  redisStore,  TimeToLive: TimeSpan.FromHours(12)),
+    new ConversationTier("cosmos", cosmosStore),          // ← authoritative: owns the version check
+]);
+```
+
+Adding another tier is adding another line — the list *is* the configuration, and any `ISharedStateStore` qualifies (Redis, the `IDistributedCache` bridge, in-memory, your own):
+
+```csharp
+new ConversationTier("memory", inMemory, TimeToLive: TimeSpan.FromMinutes(5)),
+new ConversationTier("redis",  redisStore, TimeToLive: TimeSpan.FromHours(12)),
+new ConversationTier("cosmos", cosmosStore),
+new ConversationTier("blob",   blobStore),               // ← now this one is authoritative
+```
+
+The design deliberately avoids the trap that a naive failover chain falls into — **a fallback you never wrote to is empty, so failing over to it loses the conversation, and failing *back* silently reverts it**. Write-through means every healthy tier holds the same version, so a fallback is warm and a failback is a no-op.
+
+- **The last tier is authoritative.** It performs the version check and compare-and-swap, so concurrent writers are detected exactly as with a single store.
+- **Every other tier is a replica**, written unconditionally once the authority accepts. A replica write that fails never fails the turn — the tier is marked unhealthy and its entry is **deleted**, so it can never serve a version older than the authority's.
+- **Unhealthy tiers are skipped** for reads and writes, with a cooldown that doubles per consecutive failure (capped) and an automatic retry — the same circuit-breaker shape as `ModelRouter`.
+- **A recovering tier isn't trusted straight away.** It missed every write made while it was down, so it's excluded from reads until a write-through has repaired that specific conversation.
+- **Reads take the fastest healthy tier** that has the conversation and backfill the ones that missed it.
+- **If the authority itself is down**, the save fails by default — nothing is written anywhere, so the conversation cannot fork. `AuthorityUnavailableBehavior.PromoteHealthiest` keeps serving instead, at the cost of turns living only in a non-durable tier until the authority returns.
+
+⚠️ Health is tracked **per process**. If one instance's replica write fails, other instances don't learn that the tier is stale and could read a stale copy — the authority's version check turns that into a rejected save rather than corruption, but the turn is wasted. Set `TimeToLive` on accelerator tiers to bound that window, and prefer a backend whose own replication (Redis replicas, zone redundancy) makes single-node failure invisible in the first place. Cross-service failover defends against losing a whole service in a region, which is rarer than it feels.
 
 ### Hot & cold context: conversations that never overflow
 
