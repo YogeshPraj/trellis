@@ -270,6 +270,48 @@ public class TieredConversationStoreTests
     }
 
     [Fact]
+    public async Task RepairMode_EndsOnceTheTiersTtlHasElapsed()
+    {
+        var time = new FakeTime();
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        var store = new TieredConversationStore(
+            [
+                new ConversationTier("redis", fast, TimeToLive: TimeSpan.FromMinutes(10)),
+                new ConversationTier("cosmos", durable),
+            ],
+            new TieredConversationStoreOptions { UnhealthyCooldown = TimeSpan.FromSeconds(30) },
+            time);
+
+        await store.SaveAsync(NewConversation("c1", "turn one"));
+
+        // Fast tier goes dark and keeps its stale copy through the outage.
+        fast.FailWrites = true;
+        fast.FailRemoves = true;
+        Conversation second = (await store.LoadAsync("c1"))!;
+        second.Add(new ChatMessage(ChatRole.User, "turn two"));
+        await store.SaveAsync(second);
+
+        fast.FailWrites = false;
+        fast.FailRemoves = false;
+        time.Now += TimeSpan.FromSeconds(31);       // cooldown expires → repair mode starts
+
+        // Still inside the TTL window: an untouched conversation must not be read from it.
+        await fast.SetAsync("conversation:untouched", """{"id":"untouched","version":99,"messages":[]}""");
+        Assert.Null(await store.LoadAsync("untouched"));
+
+        // Past the TTL, nothing written before the outage can still exist, so the tier is
+        // trusted wholesale again.
+        time.Now += TimeSpan.FromMinutes(11);
+        await fast.SetAsync("conversation:fresh", """{"id":"fresh","version":7,"messages":[]}""");
+
+        Conversation? served = await store.LoadAsync("fresh");
+
+        Assert.NotNull(served);
+        Assert.Equal(7, served.Version);
+    }
+
+    [Fact]
     public async Task AuthorityDown_FailsTheSaveByDefault()
     {
         var fast = new FaultyStore();

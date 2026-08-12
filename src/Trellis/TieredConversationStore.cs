@@ -100,6 +100,15 @@ public sealed class TieredConversationStore : IConversationStore
         public int ConsecutiveFailures;
         public DateTimeOffset? UnhealthyUntil;
         public bool Repairing;
+
+        /// <summary>
+        /// When repair mode can end on the clock rather than on a guess: once the tier's
+        /// TimeToLive has elapsed since recovery, no entry written before the outage can
+        /// still exist, so the tier is provably free of stale data. Null for tiers without
+        /// a TTL, which fall back to the capacity backstop.
+        /// </summary>
+        public DateTimeOffset? RepairingUntil;
+
         public HashSet<string> Repaired { get; } = new(StringComparer.Ordinal);
     }
 
@@ -384,9 +393,30 @@ public sealed class TieredConversationStore : IConversationStore
             {
                 return false;
             }
-            TierState state = _state[tier];
-            return !state.Repairing || state.Repaired.Contains(conversationId);
+            return !IsRepairingCore(tier) || _state[tier].Repaired.Contains(conversationId);
         }
+    }
+
+    /// <summary>
+    /// Whether the tier may still be holding entries from before its outage. Ends on the
+    /// clock when the tier has a TTL (nothing older can survive it), otherwise when enough
+    /// conversations have been repaired to bound the bookkeeping.
+    /// </summary>
+    private bool IsRepairingCore(int tier)
+    {
+        TierState state = _state[tier];
+        if (!state.Repairing)
+        {
+            return false;
+        }
+        if (state.RepairingUntil is DateTimeOffset until && _time.GetUtcNow() >= until)
+        {
+            state.Repairing = false;
+            state.RepairingUntil = null;
+            state.Repaired.Clear();
+            return false;
+        }
+        return true;
     }
 
     private bool IsCoolingDown(int tier)
@@ -413,6 +443,7 @@ public sealed class TieredConversationStore : IConversationStore
         // repaired, because it missed every write made while it was down.
         state.UnhealthyUntil = null;
         state.Repairing = true;
+        state.RepairingUntil = _tiers[tier].TimeToLive is TimeSpan ttl ? _time.GetUtcNow() + ttl : null;
         state.Repaired.Clear();
         _options.OnTierRecovered?.Invoke(_tiers[tier].Name);
         return false;
@@ -431,6 +462,7 @@ public sealed class TieredConversationStore : IConversationStore
                 _options.MaxUnhealthyCooldown.Ticks));
             state.UnhealthyUntil = _time.GetUtcNow() + cooldown;
             state.Repairing = true;
+            state.RepairingUntil = null;   // set when the cooldown expires and recovery starts
             state.Repaired.Clear();
             notify = true;
         }
@@ -454,16 +486,18 @@ public sealed class TieredConversationStore : IConversationStore
     {
         lock (_healthLock)
         {
-            TierState state = _state[tier];
-            if (!state.Repairing)
+            if (!IsRepairingCore(tier))
             {
                 return;
             }
+            TierState state = _state[tier];
             state.Repaired.Add(conversationId);
 
-            // Past the tracking budget, trust the tier wholesale rather than grow without
-            // bound — by then it has served many repaired writes without failing.
-            if (state.Repaired.Count >= _options.RepairTrackingCapacity)
+            // Memory backstop for tiers configured without a TTL, where repair mode has no
+            // clock to end on. This one is a bound, not a proof: a conversation untouched
+            // since the outage could still read stale afterwards — give accelerator tiers a
+            // TimeToLive to close that properly.
+            if (state.RepairingUntil is null && state.Repaired.Count >= _options.RepairTrackingCapacity)
             {
                 state.Repairing = false;
                 state.Repaired.Clear();

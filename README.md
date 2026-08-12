@@ -376,8 +376,8 @@ The design deliberately avoids the trap that a naive failover chain falls into �
 
 - **The last tier is authoritative.** It performs the version check and compare-and-swap, so concurrent writers are detected exactly as with a single store.
 - **Every other tier is a replica**, written unconditionally once the authority accepts. A replica write that fails never fails the turn — the tier is marked unhealthy and its entry is **deleted**, so it can never serve a version older than the authority's.
-- **Unhealthy tiers are skipped** for reads and writes, with a cooldown that doubles per consecutive failure (capped) and an automatic retry — the same circuit-breaker shape as `ModelRouter`.
-- **A recovering tier isn't trusted straight away.** It missed every write made while it was down, so it's excluded from reads until a write-through has repaired that specific conversation.
+- **Unhealthy tiers are skipped** for reads and writes, with a cooldown that doubles per consecutive failure (capped) — the same circuit-breaker shape as `ModelRouter`. The recheck is lazy and uses the next real operation as its probe, so there's no background poller hammering a struggling backend. Set `MaxUnhealthyCooldown` equal to `UnhealthyCooldown` for a flat recheck interval.
+- **A recovering tier isn't trusted straight away.** It missed every write made while it was down, so it's excluded from reads until a write-through has repaired that specific conversation — which normal traffic does on its own, since a read falls to the authority and the backfill repopulates the tier. Repair mode ends once the tier's `TimeToLive` has elapsed since recovery, at which point no pre-outage entry can still exist.
 - **Reads take the fastest healthy tier** that has the conversation and backfill the ones that missed it.
 - **If the authority itself is down**, the save fails by default — nothing is written anywhere, so the conversation cannot fork. `AuthorityUnavailableBehavior.PromoteHealthiest` keeps serving instead, at the cost of turns living only in a non-durable tier until the authority returns.
 
