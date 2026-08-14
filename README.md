@@ -403,6 +403,31 @@ The design deliberately avoids the trap that a naive failover chain falls into �
 - **A recovering tier isn't trusted straight away.** It missed every write made while it was down, so it's excluded from reads until a write-through has repaired that specific conversation — which normal traffic does on its own, since a read falls to the authority and the backfill repopulates the tier. Repair mode ends once the tier's `TimeToLive` has elapsed since recovery, at which point no pre-outage entry can still exist.
 - **Reads take the fastest healthy tier** that has the conversation and backfill the ones that missed it.
 - **Replicas are written concurrently**, so a save costs the authority's round trip plus the *slowest* replica — not the sum of every tier. The snapshot is serialized once and reused across tiers.
+
+#### Write-behind: pay one fast round trip
+
+If even that is too much — or you want a durable-tier outage to stop failing turns — switch the mode:
+
+```csharp
+new TieredConversationStoreOptions
+{
+    ReplicationMode = ReplicationMode.WriteBehind,   // only tier 0 is written synchronously
+    FlushInterval   = TimeSpan.FromSeconds(1),
+    OnReplicationFailed = (id, ex) => logger.LogError(ex, "replication lagging for {Id}", id),
+}
+```
+
+Only the **first** tier is written before `SaveAsync` returns — and it becomes the authority, since it's the only tier guaranteed current. The rest are updated by a background flusher, and `await using` (or an explicit `FlushAsync()`) drains it on shutdown.
+
+⚠️ **This changes the guarantee.** A returned save is *not yet durable*: turns written since the last flush live only in tier 0. An abrupt process kill loses up to `FlushInterval` of work. In exchange, saves cost one fast round trip and the durable tier being down no longer fails a turn.
+
+What keeps the blast radius small:
+
+- **Snapshots are cumulative, not deltas.** A lagging tier holds a complete, older conversation — never a corrupt one. Losing unflushed writes costs the turns since the last flush, not the session.
+- **Pending writes coalesce per conversation.** Twenty turns in a second replicate once, and the pending set is bounded by *active conversations*, not by traffic.
+- **A write that doesn't land stays pending.** If the durable tier is down or cooling, the write re-queues for the next tick instead of being dropped — otherwise a turn that failed to replicate would vanish from the durable tier the moment that conversation went idle.
+- **Replica writes are version-conditional**, so a late flush can never put an older snapshot on top of a newer one.
+- **`MaxPendingReplications`** applies backpressure by flushing inline rather than letting the pending set grow unbounded.
 - **If the authority itself is down**, the save fails by default — nothing is written anywhere, so the conversation cannot fork. `AuthorityUnavailableBehavior.PromoteHealthiest` keeps serving instead, at the cost of turns living only in a non-durable tier until the authority returns.
 
 ⚠️ Health is tracked **per process**. If one instance's replica write fails, other instances don't learn that the tier is stale and could read a stale copy — the authority's version check turns that into a rejected save rather than corruption, but the turn is wasted. Set `TimeToLive` on accelerator tiers to bound that window, and prefer a backend whose own replication (Redis replicas, zone redundancy) makes single-node failure invisible in the first place. Cross-service failover defends against losing a whole service in a region, which is rarer than it feels.

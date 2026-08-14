@@ -463,6 +463,169 @@ public class TieredConversationStoreTests
         Assert.Equal(4, (await store.LoadAsync("session-1"))!.Messages.Count);
     }
 
+    private static TieredConversationStore WriteBehind(
+        FaultyStore fast, FaultyStore durable, TieredConversationStoreOptions? options = null) =>
+        new([new ConversationTier("redis", fast), new ConversationTier("cosmos", durable)],
+            options ?? new TieredConversationStoreOptions
+            {
+                ReplicationMode = ReplicationMode.WriteBehind,
+                FlushInterval = TimeSpan.FromMilliseconds(20),
+                UnhealthyCooldown = TimeSpan.FromMilliseconds(50),
+                MaxUnhealthyCooldown = TimeSpan.FromMilliseconds(50),
+            });
+
+    [Fact]
+    public async Task WriteBehind_ReturnsOnceTheFastTierHasIt()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        await store.SaveAsync(NewConversation("c1", "hello"));
+
+        // The fast tier is the authority now, and it has the turn immediately.
+        Assert.Equal("redis", store.AuthorityName);
+        Assert.NotNull(await fast.PeekAsync("conversation:c1"));
+        // The durable tier is updated by the flusher, so it is not required to be there yet.
+        Assert.Equal(1, store.PendingReplicationCount);
+    }
+
+    [Fact]
+    public async Task WriteBehind_FlushReachesTheDurableTier()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        await store.SaveAsync(NewConversation("c1", "hello"));
+        await store.FlushAsync();
+
+        Assert.NotNull(await durable.PeekAsync("conversation:c1"));
+        Assert.Equal(0, store.PendingReplicationCount);
+    }
+
+    [Fact]
+    public async Task WriteBehind_CoalescesManyTurnsIntoOneReplication()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        var conversation = NewConversation("c1", "turn one");
+        for (int i = 0; i < 20; i++)
+        {
+            conversation.Add(new ChatMessage(ChatRole.User, "turn " + i));
+            await store.SaveAsync(conversation);
+        }
+
+        // Twenty turns, one pending entry — the map is bounded by conversations, not traffic.
+        Assert.Equal(1, store.PendingReplicationCount);
+
+        int writesBefore = durable.Writes;
+        await store.FlushAsync();
+        Assert.Equal(writesBefore + 1, durable.Writes);
+        Assert.Equal(20, (await store.LoadAsync("c1"))!.Version);
+    }
+
+    [Fact]
+    public async Task WriteBehind_DurableTierDown_DoesNotFailTheTurn()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore { FailWrites = true, FailReads = true };
+        List<string> failures = [];
+        await using TieredConversationStore store = WriteBehind(fast, durable, new TieredConversationStoreOptions
+        {
+            ReplicationMode = ReplicationMode.WriteBehind,
+            FlushInterval = TimeSpan.FromMilliseconds(20),
+            OnReplicationFailed = (id, _) => failures.Add(id),
+        });
+
+        await store.SaveAsync(NewConversation("c1", "hello"));   // must not throw
+        await store.FlushAsync();
+
+        Assert.Equal("hello", (await store.LoadAsync("c1"))!.Messages[0].Text);
+    }
+
+    [Fact]
+    public async Task WriteBehind_RetriesUntilTheDurableTierActuallyTakesIt()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore { FailWrites = true };
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        await store.SaveAsync(NewConversation("c1", "hello"));
+        await store.FlushAsync();
+
+        // The write must NOT be discarded: without a retry the turn would be missing from the
+        // durable tier for good once this conversation went idle.
+        Assert.Equal(1, store.PendingReplicationCount);
+        Assert.Null(await durable.PeekAsync("conversation:c1"));
+
+        durable.FailWrites = false;
+        // The tier is cooling down after its failure; once that expires the retry lands.
+        for (int attempt = 0; attempt < 60 && store.PendingReplicationCount > 0; attempt++)
+        {
+            await Task.Delay(60);
+            await store.FlushAsync();
+        }
+
+        Assert.Equal(0, store.PendingReplicationCount);
+        Assert.NotNull(await durable.PeekAsync("conversation:c1"));
+    }
+
+    [Fact]
+    public async Task WriteBehind_DisposalFlushesSoAGracefulShutdownLosesNothing()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        var store = WriteBehind(fast, durable);
+
+        await store.SaveAsync(NewConversation("c1", "hello"));
+        await store.DisposeAsync();
+
+        Assert.NotNull(await durable.PeekAsync("conversation:c1"));
+    }
+
+    [Fact]
+    public async Task WriteBehind_StaleReplicaIsTimeTravelled_NotCorrupt()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        var conversation = NewConversation("c1", "turn one");
+        await store.SaveAsync(conversation);
+        await store.FlushAsync();                      // durable holds v1
+
+        conversation.Add(new ChatMessage(ChatRole.User, "turn two"));
+        await store.SaveAsync(conversation);           // v2 pending only
+
+        // Snapshots are cumulative, so the durable tier holds a complete older conversation
+        // rather than a partial one — losing the pending write costs turns, never coherence.
+        Conversation durableCopy = (await new SharedStateConversationStore(durable).LoadAsync("c1"))!;
+        Assert.Equal(1, durableCopy.Version);
+        Assert.Equal("turn one", Assert.Single(durableCopy.Messages).Text);
+    }
+
+    [Fact]
+    public async Task WriteBehind_OlderFlushCannotOverwriteANewerSnapshot()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        var conversation = NewConversation("c1", "turn one");
+        await store.SaveAsync(conversation);
+        conversation.Add(new ChatMessage(ChatRole.User, "turn two"));
+        await store.SaveAsync(conversation);
+        await store.FlushAsync();                      // durable now at v2
+
+        // A late flush carrying v1 (another instance, delayed) must not regress the replica.
+        await store.FlushAsync();
+        Conversation durableCopy = (await new SharedStateConversationStore(durable).LoadAsync("c1"))!;
+        Assert.Equal(2, durableCopy.Version);
+    }
+
     [Fact]
     public void RejectsEmptyOrDuplicateTiers()
     {

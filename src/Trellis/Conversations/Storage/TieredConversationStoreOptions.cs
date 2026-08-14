@@ -6,6 +6,34 @@ namespace Trellis.Conversations.Storage;
 /// <summary>Options for <see cref="TieredConversationStore"/>.</summary>
 public sealed class TieredConversationStoreOptions
 {
+    /// <summary>
+    /// Whether replicas are written before <c>SaveAsync</c> returns, or handed to a
+    /// background flusher (default <see cref="ReplicationMode.WriteThrough"/>).
+    /// </summary>
+    public ReplicationMode ReplicationMode { get; init; } = ReplicationMode.WriteThrough;
+
+    /// <summary>
+    /// How often the background flusher drains pending replications in
+    /// <see cref="ReplicationMode.WriteBehind"/> (default 1s). This interval is also the
+    /// floor on how much work an unexpected process death can lose.
+    /// </summary>
+    public TimeSpan FlushInterval { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Ceiling on conversations awaiting background replication (default 10,000). Pending
+    /// writes are coalesced per conversation, so this bounds *active conversations*, not
+    /// turns. Past the ceiling a save flushes inline rather than growing without bound —
+    /// backpressure, not silent loss.
+    /// </summary>
+    public int MaxPendingReplications { get; init; } = 10_000;
+
+    /// <summary>
+    /// Called when a background replication fails after the write already returned success
+    /// to the caller. This is the only place such a failure can surface — wire it up, or
+    /// durability problems are invisible.
+    /// </summary>
+    public Action<string, Exception>? OnReplicationFailed { get; init; }
+
     /// <summary>How long a failed tier is skipped before it is retried (default 30s).</summary>
     public TimeSpan UnhealthyCooldown { get; init; } = TimeSpan.FromSeconds(30);
 

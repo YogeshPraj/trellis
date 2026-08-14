@@ -33,7 +33,7 @@ namespace Trellis.Conversations.Storage;
 /// single-node failure invisible in the first place.
 /// </para>
 /// </remarks>
-public sealed class TieredConversationStore : IConversationStore
+public sealed class TieredConversationStore : IConversationStore, IAsyncDisposable
 {
     private sealed class TierState
     {
@@ -52,11 +52,21 @@ public sealed class TieredConversationStore : IConversationStore
         public HashSet<string> Repaired { get; } = new(StringComparer.Ordinal);
     }
 
+    /// <summary>A conversation awaiting background replication; newer versions replace older.</summary>
+    private sealed record PendingWrite(string Key, string ConversationId, int Version, string Json);
+
     private readonly IReadOnlyList<ConversationTier> _tiers;
     private readonly TierState[] _state;
     private readonly TieredConversationStoreOptions _options;
     private readonly TimeProvider _time;
     private readonly Lock _healthLock = new();
+
+    // Coalesced by conversation id: a chatty session costs one replication, not one per turn,
+    // and the map is bounded by active conversations rather than by traffic.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, PendingWrite> _pending = new();
+    private readonly CancellationTokenSource _flusherShutdown = new();
+    private readonly Task? _flusher;
+    private int _disposed;
 
     public TieredConversationStore(
         IReadOnlyList<ConversationTier> tiers,
@@ -84,6 +94,11 @@ public sealed class TieredConversationStore : IConversationStore
         _state = [.. tiers.Select(_ => new TierState())];
         _options = options ?? new TieredConversationStoreOptions();
         _time = timeProvider ?? TimeProvider.System;
+
+        if (_options.ReplicationMode == ReplicationMode.WriteBehind && _tiers.Count > 1)
+        {
+            _flusher = RunFlusherAsync(_flusherShutdown.Token);
+        }
     }
 
     public TieredConversationStore(params ConversationTier[] tiers)
@@ -91,8 +106,12 @@ public sealed class TieredConversationStore : IConversationStore
     {
     }
 
-    /// <summary>The durable tier that owns version checking — the last one in the chain.</summary>
-    public string AuthorityName => _tiers[^1].Name;
+    /// <summary>
+    /// The tier that owns version checking: the last (durable) tier under write-through, the
+    /// first under write-behind — in both cases, the one written synchronously.
+    /// </summary>
+    public string AuthorityName =>
+        _tiers[_options.ReplicationMode == ReplicationMode.WriteBehind ? 0 : ^1].Name;
 
     /// <summary>Tier names currently skipped because they are cooling down after a failure.</summary>
     public IReadOnlyList<string> UnhealthyTiers
@@ -143,7 +162,8 @@ public sealed class TieredConversationStore : IConversationStore
 
             if (_options.BackfillOnRead && i > 0)
             {
-                await BackfillAsync(key, conversationId, json, upToTier: i, cancellationToken).ConfigureAwait(false);
+                await BackfillAsync(key, conversationId, snapshot.Version, json, upToTier: i, cancellationToken)
+                    .ConfigureAwait(false);
             }
             return ConversationSerializer.ToConversation(snapshot);
         }
@@ -160,22 +180,158 @@ public sealed class TieredConversationStore : IConversationStore
             .ConfigureAwait(false);
         conversation.MarkPersisted(next);
 
+        if (_options.ReplicationMode == ReplicationMode.WriteBehind)
+        {
+            QueueReplication(new PendingWrite(key, conversation.Id, next, json));
+
+            // Past the ceiling, flush inline: backpressure on this caller is honest, and
+            // beats a queue that grows until the process dies.
+            if (_pending.Count > _options.MaxPendingReplications)
+            {
+                await FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+            return;
+        }
+
         // The authority has accepted; every other tier is now a replica to bring in line.
         // They are independent backends, so writing them concurrently costs the slowest
         // replica rather than the sum of all of them.
-        List<Task>? replicas = null;
+        await ReplicateToOthersAsync(authority, key, conversation.Id, next, json, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes a snapshot to every healthy tier except <paramref name="skipTier"/>, concurrently.
+    /// Returns false if any target did not end up holding it — because it was cooling down, or
+    /// because the write failed — so a background flush knows to try again.
+    /// </summary>
+    private async ValueTask<bool> ReplicateToOthersAsync(
+        int skipTier, string key, string conversationId, int version, string json, CancellationToken cancellationToken)
+    {
+        List<Task<bool>>? replicas = null;
+        bool allApplied = true;
         for (int i = 0; i < _tiers.Count; i++)
         {
-            if (i == authority || IsCoolingDown(i))
+            if (i == skipTier)
             {
                 continue;
             }
-            (replicas ??= []).Add(ReplicateAsync(i, key, conversation.Id, json, cancellationToken).AsTask());
+            if (IsCoolingDown(i))
+            {
+                allApplied = false;     // skipped, so this tier is still behind
+                continue;
+            }
+            (replicas ??= []).Add(ReplicateAsync(i, key, conversationId, version, json, cancellationToken).AsTask());
         }
         if (replicas is not null)
         {
-            await Task.WhenAll(replicas).ConfigureAwait(false);
+            bool[] results = await Task.WhenAll(replicas).ConfigureAwait(false);
+            allApplied &= results.All(applied => applied);
         }
+        return allApplied;
+    }
+
+    /// <summary>Records the newest snapshot for a conversation, discarding any older pending one.</summary>
+    private void QueueReplication(PendingWrite write) =>
+        _pending.AddOrUpdate(
+            write.ConversationId,
+            write,
+            (_, existing) => existing.Version >= write.Version ? existing : write);
+
+    /// <summary>Conversations currently awaiting background replication.</summary>
+    public int PendingReplicationCount => _pending.Count;
+
+    /// <summary>
+    /// Drains every pending background replication. Call before shutdown — disposal does it
+    /// too — so a graceful stop loses nothing.
+    /// </summary>
+    /// <remarks>
+    /// One pass over what is pending right now. Writes that could not be applied re-queue
+    /// themselves for the next tick rather than being retried in a loop here — looping would
+    /// spin forever while a target tier is down.
+    /// </remarks>
+    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    {
+        List<Task>? writes = null;
+        foreach (string id in _pending.Keys)
+        {
+            if (_pending.TryRemove(id, out PendingWrite? write))
+            {
+                (writes ??= []).Add(FlushOneAsync(write, cancellationToken));
+            }
+        }
+        if (writes is not null)
+        {
+            await Task.WhenAll(writes).ConfigureAwait(false);
+        }
+    }
+
+    private async Task FlushOneAsync(PendingWrite write, CancellationToken cancellationToken)
+    {
+        bool applied;
+        try
+        {
+            // Tier 0 already has it — it was written synchronously.
+            applied = await ReplicateToOthersAsync(
+                skipTier: 0, write.Key, write.ConversationId, write.Version, write.Json, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The caller was already told the save succeeded, so this is the only place such
+            // a failure can surface.
+            _options.OnReplicationFailed?.Invoke(write.ConversationId, ex);
+            applied = false;
+        }
+
+        if (!applied)
+        {
+            // Put it back so the next tick retries. Coalescing means this cannot grow the
+            // map, and a newer turn simply supersedes it — without this, a turn that failed
+            // to replicate would be lost from the durable tier for good once the
+            // conversation went idle.
+            QueueReplication(write);
+        }
+    }
+
+    private async Task RunFlusherAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(_options.FlushInterval, _time, cancellationToken).ConfigureAwait(false);
+                await FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down; DisposeAsync performs the final flush.
+        }
+    }
+
+    /// <summary>Stops the background flusher after draining whatever it still holds.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
+        await _flusherShutdown.CancelAsync().ConfigureAwait(false);
+        if (_flusher is not null)
+        {
+            try
+            {
+                await _flusher.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        await FlushAsync(CancellationToken.None).ConfigureAwait(false);
+        _flusherShutdown.Dispose();
     }
 
     public async ValueTask DeleteAsync(string conversationId, CancellationToken cancellationToken = default)
@@ -261,16 +417,30 @@ public sealed class TieredConversationStore : IConversationStore
     /// Copies the accepted snapshot to a replica tier. Failure never fails the turn, but the
     /// tier's entry is removed so it can never serve a version older than the authority's.
     /// </summary>
-    private async ValueTask ReplicateAsync(
-        int tier, string key, string conversationId, string json, CancellationToken cancellationToken)
+    /// <remarks>
+    /// The write is version-conditional. Two instances replicating concurrently — or a
+    /// background flush landing late — could otherwise put an older snapshot on top of a
+    /// newer one, leaving the replica stale while looking healthy.
+    /// </remarks>
+    private async ValueTask<bool> ReplicateAsync(
+        int tier, string key, string conversationId, int version, string json, CancellationToken cancellationToken)
     {
         try
         {
+            string? current = await _tiers[tier].Store.GetAsync(key, cancellationToken).ConfigureAwait(false);
+            if (current is not null && ConversationSerializer.Deserialize(current)?.Version >= version)
+            {
+                MarkHealthy(tier);
+                MarkRepaired(tier, conversationId);
+                return true;   // a newer snapshot already landed here
+            }
+
             await _tiers[tier].Store
                 .SetAsync(key, json, _tiers[tier].TimeToLive, cancellationToken)
                 .ConfigureAwait(false);
             MarkHealthy(tier);
             MarkRepaired(tier, conversationId);
+            return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -284,11 +454,12 @@ public sealed class TieredConversationStore : IConversationStore
                 // The tier is already unhealthy and skipped for reads; TimeToLive is the
                 // backstop that stops the orphaned entry outliving the outage.
             }
+            return false;
         }
     }
 
     private async ValueTask BackfillAsync(
-        string key, string conversationId, string json, int upToTier, CancellationToken cancellationToken)
+        string key, string conversationId, int version, string json, int upToTier, CancellationToken cancellationToken)
     {
         List<Task>? writes = null;
         for (int i = 0; i < upToTier; i++)
@@ -297,7 +468,7 @@ public sealed class TieredConversationStore : IConversationStore
             {
                 continue;
             }
-            (writes ??= []).Add(ReplicateAsync(i, key, conversationId, json, cancellationToken).AsTask());
+            (writes ??= []).Add(ReplicateAsync(i, key, conversationId, version, json, cancellationToken).AsTask());
         }
         if (writes is not null)
         {
@@ -306,30 +477,42 @@ public sealed class TieredConversationStore : IConversationStore
     }
 
     /// <summary>
-    /// The tier that owns version checking: the last one, unless it is cooling down and the
-    /// caller opted into promotion.
+    /// The tier that owns version checking. Write-through puts it on the last (most durable)
+    /// tier; write-behind puts it on the first, because that is the only tier guaranteed
+    /// current when the save returns. Either way it is the synchronously-written tier.
     /// </summary>
     private int ResolveAuthority()
     {
-        int last = _tiers.Count - 1;
-        if (!IsCoolingDown(last))
+        int preferred = _options.ReplicationMode == ReplicationMode.WriteBehind ? 0 : _tiers.Count - 1;
+        if (!IsCoolingDown(preferred) || _options.OnAuthorityUnavailable == AuthorityUnavailableBehavior.Fail)
         {
-            return last;
+            // When configured to fail, still return the preferred tier: failing the save is
+            // the intended outcome, and probing keeps recovery immediate.
+            return preferred;
         }
-        if (_options.OnAuthorityUnavailable == AuthorityUnavailableBehavior.Fail)
+
+        // Promote the nearest healthy tier, searching away from the preferred position.
+        if (_options.ReplicationMode == ReplicationMode.WriteBehind)
         {
-            // Retry it anyway: failing the save is the configured outcome, and probing keeps
-            // recovery immediate instead of waiting out the cooldown.
-            return last;
-        }
-        for (int i = last - 1; i >= 0; i--)
-        {
-            if (!IsCoolingDown(i))
+            for (int i = 1; i < _tiers.Count; i++)
             {
-                return i;
+                if (!IsCoolingDown(i))
+                {
+                    return i;
+                }
             }
         }
-        return last;
+        else
+        {
+            for (int i = preferred - 1; i >= 0; i--)
+            {
+                if (!IsCoolingDown(i))
+                {
+                    return i;
+                }
+            }
+        }
+        return preferred;
     }
 
     /// <summary>
