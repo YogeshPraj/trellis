@@ -156,19 +156,25 @@ public sealed class TieredConversationStore : IConversationStore
         string key = _options.KeyPrefix + conversation.Id;
 
         int authority = ResolveAuthority();
-        int next = await WriteAuthorityAsync(authority, key, conversation, cancellationToken).ConfigureAwait(false);
-
-        // The authority has accepted; every other tier is now a replica to bring in line.
-        string json = ConversationSerializer.Serialize(conversation, next);
+        (int next, string json) = await WriteAuthorityAsync(authority, key, conversation, cancellationToken)
+            .ConfigureAwait(false);
         conversation.MarkPersisted(next);
 
+        // The authority has accepted; every other tier is now a replica to bring in line.
+        // They are independent backends, so writing them concurrently costs the slowest
+        // replica rather than the sum of all of them.
+        List<Task>? replicas = null;
         for (int i = 0; i < _tiers.Count; i++)
         {
             if (i == authority || IsCoolingDown(i))
             {
                 continue;
             }
-            await ReplicateAsync(i, key, conversation.Id, json, cancellationToken).ConfigureAwait(false);
+            (replicas ??= []).Add(ReplicateAsync(i, key, conversation.Id, json, cancellationToken).AsTask());
+        }
+        if (replicas is not null)
+        {
+            await Task.WhenAll(replicas).ConfigureAwait(false);
         }
     }
 
@@ -202,9 +208,10 @@ public sealed class TieredConversationStore : IConversationStore
 
     /// <summary>
     /// Writes through the authoritative tier, which performs the version check and
-    /// compare-and-swap. Returns the version it accepted.
+    /// compare-and-swap. Returns the version it accepted together with the serialized
+    /// snapshot, so replicas reuse it instead of re-serializing the whole conversation.
     /// </summary>
-    private async ValueTask<int> WriteAuthorityAsync(
+    private async ValueTask<(int Version, string Json)> WriteAuthorityAsync(
         int authority, string key, Conversation conversation, CancellationToken cancellationToken)
     {
         ISharedStateStore store = _tiers[authority].Store;
@@ -237,7 +244,7 @@ public sealed class TieredConversationStore : IConversationStore
 
             MarkHealthy(authority);
             MarkRepaired(authority, conversation.Id);
-            return next;
+            return (next, json);
         }
         catch (ConversationConcurrencyException)
         {
@@ -283,13 +290,18 @@ public sealed class TieredConversationStore : IConversationStore
     private async ValueTask BackfillAsync(
         string key, string conversationId, string json, int upToTier, CancellationToken cancellationToken)
     {
+        List<Task>? writes = null;
         for (int i = 0; i < upToTier; i++)
         {
             if (IsCoolingDown(i))
             {
                 continue;
             }
-            await ReplicateAsync(i, key, conversationId, json, cancellationToken).ConfigureAwait(false);
+            (writes ??= []).Add(ReplicateAsync(i, key, conversationId, json, cancellationToken).AsTask());
+        }
+        if (writes is not null)
+        {
+            await Task.WhenAll(writes).ConfigureAwait(false);
         }
     }
 

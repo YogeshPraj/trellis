@@ -111,6 +111,55 @@ public class TieredConversationStoreTests
         Assert.NotNull(await store.LoadAsync("c1"));
     }
 
+    /// <summary>A store whose writes take a fixed time, for observing replication concurrency.</summary>
+    private sealed class SlowStore(TimeSpan writeDelay) : IAtomicSharedStateStore
+    {
+        private readonly InMemorySharedStateStore _inner = new();
+
+        public ValueTask<string?> GetAsync(string key, CancellationToken cancellationToken = default) =>
+            _inner.GetAsync(key, cancellationToken);
+
+        public async ValueTask SetAsync(string key, string value, TimeSpan? timeToLive = null, CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(writeDelay, cancellationToken);
+            await _inner.SetAsync(key, value, timeToLive, cancellationToken);
+        }
+
+        public ValueTask RemoveAsync(string key, CancellationToken cancellationToken = default) =>
+            _inner.RemoveAsync(key, cancellationToken);
+
+        public ValueTask<bool> TrySetIfUnchangedAsync(
+            string key, string? expectedValue, string newValue, TimeSpan? timeToLive = null, CancellationToken cancellationToken = default) =>
+            _inner.TrySetIfUnchangedAsync(key, expectedValue, newValue, timeToLive, cancellationToken);
+
+        public ValueTask<long> IncrementAsync(string key, CancellationToken cancellationToken = default) =>
+            _inner.IncrementAsync(key, cancellationToken);
+
+        public ValueTask<long> AppendAsync(string key, string value, CancellationToken cancellationToken = default) =>
+            _inner.AppendAsync(key, value, cancellationToken);
+
+        public ValueTask<IReadOnlyList<string>> GetListAsync(string key, CancellationToken cancellationToken = default) =>
+            _inner.GetListAsync(key, cancellationToken);
+    }
+
+    [Fact]
+    public async Task ReplicasAreWrittenConcurrently_NotOneAfterAnother()
+    {
+        var delay = TimeSpan.FromMilliseconds(200);
+        var store = new TieredConversationStore(
+            new ConversationTier("r1", new SlowStore(delay)),
+            new ConversationTier("r2", new SlowStore(delay)),
+            new ConversationTier("r3", new SlowStore(delay)),
+            new ConversationTier("authority", new FaultyStore()));
+
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        await store.SaveAsync(NewConversation("c1", "hello"));
+        TimeSpan elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(start);
+
+        // Three 200ms replicas: concurrent is ~200ms, sequential would be ~600ms.
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(500), $"replicas were written serially ({elapsed})");
+    }
+
     [Fact]
     public async Task ReadsPreferTheFastestTier()
     {
