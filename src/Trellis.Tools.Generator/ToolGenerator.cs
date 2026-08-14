@@ -44,7 +44,7 @@ public sealed class ToolGenerator : IIncrementalGenerator
     {
         IncrementalValueProvider<ImmutableArray<ToolModel>> tools = context.SyntaxProvider
             .ForAttributeWithMetadataName(
-                "Trellis.ToolAttribute",
+                "Trellis.Tools.ToolAttribute",
                 predicate: static (node, _) => node is MethodDeclarationSyntax,
                 transform: static (ctx, _) => Extract(ctx))
             .Where(static m => m is not null)

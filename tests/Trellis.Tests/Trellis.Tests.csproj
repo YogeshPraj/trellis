@@ -35,4 +35,24 @@
     <ProjectReference Include="..\..\src\Trellis.Azure.Cosmos\Trellis.Azure.Cosmos.csproj" />
   </ItemGroup>
 
+  <!-- Tests reach across every subsystem; global usings keep the noise out of the test files. -->
+  <ItemGroup>
+    <Using Include="Trellis.Agents" />
+    <Using Include="Trellis.Outputs" />
+    <Using Include="Trellis.Conversations" />
+    <Using Include="Trellis.Conversations.Archive" />
+    <Using Include="Trellis.Conversations.Compaction" />
+    <Using Include="Trellis.Conversations.Storage" />
+    <Using Include="Trellis.Diagnostics" />
+    <Using Include="Trellis.Tokens" />
+    <Using Include="Trellis.Tools" />
+    <Using Include="Trellis.Graph.Checkpointing" />
+    <Using Include="Trellis.Graph.Diagnostics" />
+    <Using Include="Trellis.Graph.Resilience" />
+    <Using Include="Trellis.Routing.Capabilities" />
+    <Using Include="Trellis.Routing.Failures" />
+    <Using Include="Trellis.Routing.Health" />
+    <Using Include="Trellis.Routing.Selection" />
+  </ItemGroup>
+
 </Project>

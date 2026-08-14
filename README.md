@@ -45,7 +45,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 
 ```csharp
 using Microsoft.Extensions.AI;
-using Trellis;
+using Trellis.Agents;
 
 record FlightResult(string Destination, decimal Price);
 
@@ -110,6 +110,7 @@ Models sometimes return JSON that doesn't parse, or values that parse but are wr
 
 ```csharp
 using System.ComponentModel.DataAnnotations;
+using Trellis.Outputs;
 
 record Booking(
     [property: Required] string Destination,
@@ -471,6 +472,35 @@ AgentTelemetry.CostModel = new StaticTokenCostModel(new Dictionary<string, Model
 ```
 
 An unknown model prices as `null`, never `0` — a dashboard can then distinguish "not priced" from "free". With nothing listening, instrumentation costs a null check per run.
+
+## Namespaces
+
+Types are grouped by subsystem rather than dumped in one namespace, so the shape of the
+library is visible from the `using` list:
+
+| Namespace | What lives there |
+|---|---|
+| `Trellis.Agents` | `Agent<TResult>`, `Agent<TDeps,TResult>`, `AgentRunResult`, `AgentStream` |
+| `Trellis.Outputs` | `IOutputValidator<T>`, `OutputRetryOptions`, validators, `OutputValidationException` |
+| `Trellis.Conversations` | `Conversation` |
+| `Trellis.Conversations.Compaction` | `ConversationCompactor`, `CompactionOptions`, summarizers |
+| `Trellis.Conversations.Archive` | `IConversationArchive` and providers |
+| `Trellis.Conversations.Storage` | `IConversationStore`, `TieredConversationStore`, providers |
+| `Trellis.Tokens` | `ITokenCounter`, `HeuristicTokenCounter` |
+| `Trellis.Diagnostics` | `AgentTelemetry`, `ITokenCostModel`, pricing |
+| `Trellis.Tools` | `[Tool]` attribute |
+| `Trellis.Graph` | `StateGraph<T>`, `CompiledGraph<T>`, events, results |
+| `Trellis.Graph.Checkpointing` | `ICheckpointer<T>`, `Checkpoint<T>` |
+| `Trellis.Graph.Resilience` | `NodeResilience<T>`, `INodeRetryPolicy` |
+| `Trellis.Routing` | `ModelRouter`, `ModelEndpoint`, options |
+| `Trellis.Routing.Selection` | Load-balancing strategies |
+| `Trellis.Routing.Failures` | Classification and policy |
+| `Trellis.Routing.Health` | Circuit-breaker state |
+| `Trellis.Routing.Capabilities` | `ModelCapabilities`, `ModelFeatures` |
+
+> ⚠️ **Breaking in 0.11.0.** Everything used to sit in a flat `Trellis` namespace. Replace
+> `using Trellis;` with the subsystem namespaces you actually use — the compiler will name
+> them. `[Tool]` now needs `using Trellis.Tools;`.
 
 ## Packages
 

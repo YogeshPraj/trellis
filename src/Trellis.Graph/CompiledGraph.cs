@@ -2,6 +2,9 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using Trellis.Graph.Checkpointing;
+using Trellis.Graph.Diagnostics;
+using Trellis.Graph.Resilience;
 
 namespace Trellis.Graph;
 

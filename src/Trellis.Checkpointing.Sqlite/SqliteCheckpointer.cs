@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Trellis.Graph;
+using Trellis.Graph.Checkpointing;
 
 namespace Trellis.Checkpointing.Sqlite;
 

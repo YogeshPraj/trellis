@@ -1,4 +1,8 @@
 using Microsoft.Extensions.AI;
+using Trellis.Routing.Capabilities;
+using Trellis.Routing.Failures;
+using Trellis.Routing.Health;
+using Trellis.Routing.Selection;
 
 namespace Trellis.Routing;
 
@@ -54,67 +58,4 @@ public sealed class ModelEndpoint
     }
 
     private readonly int _weight = 1;
-}
-
-/// <summary>What the router does when every endpoint is cooling down.</summary>
-public enum AllTrippedBehavior
-{
-    /// <summary>Try the endpoint whose cooldown expires soonest anyway (graceful degradation).</summary>
-    TryAnyway,
-
-    /// <summary>Fail fast with <see cref="AllModelsUnavailableException"/>.</summary>
-    Throw,
-}
-
-/// <summary>Configuration for <see cref="ModelRouter"/>.</summary>
-public sealed class ModelRouterOptions
-{
-    /// <summary>Cooldown after an endpoint's first failure. Doubles per consecutive failure.</summary>
-    public TimeSpan BaseCooldown { get; set; } = TimeSpan.FromSeconds(30);
-
-    /// <summary>Upper bound for the exponential cooldown.</summary>
-    public TimeSpan MaxCooldown { get; set; } = TimeSpan.FromMinutes(10);
-
-    /// <summary>Turns provider exceptions into typed failures (status codes, Retry-After).</summary>
-    public IFailureClassifier FailureClassifier { get; set; } = new DefaultFailureClassifier();
-
-    /// <summary>
-    /// Maps failure kinds to actions — e.g. context-window overflows fail over without
-    /// tripping the (healthy) endpoint, unknown errors propagate.
-    /// </summary>
-    public IFailurePolicy FailurePolicy { get; set; } = new DefaultFailurePolicy();
-
-    /// <summary>
-    /// Where circuit-breaker state lives. Swap the in-process default for a shared store
-    /// (Redis, SQL) so all app instances agree on which deployments are cooling down.
-    /// </summary>
-    public IEndpointHealthStore HealthStore { get; set; } = new InMemoryEndpointHealthStore();
-
-    /// <summary>How endpoints within one priority tier are ordered per request.</summary>
-    public IEndpointSelectionStrategy SelectionStrategy { get; set; } = new RoundRobinSelectionStrategy();
-
-    /// <summary>Behavior when every endpoint is cooling down. Default: try the soonest-recovering one.</summary>
-    public AllTrippedBehavior AllTrippedBehavior { get; set; } = AllTrippedBehavior.TryAnyway;
-
-    /// <summary>Called when an endpoint is taken out of rotation (name, cause, unavailable-until).</summary>
-    public Action<ModelEndpoint, Exception, DateTimeOffset>? OnEndpointTripped { get; set; }
-
-    /// <summary>Called when a previously tripped endpoint serves a request again.</summary>
-    public Action<ModelEndpoint>? OnEndpointRecovered { get; set; }
-
-    /// <summary>Clock, overridable for tests. Defaults to <see cref="TimeProvider.System"/>.</summary>
-    public TimeProvider? TimeProvider { get; set; }
-}
-
-/// <summary>Thrown when no endpoint could serve the request.</summary>
-public sealed class AllModelsUnavailableException : Exception
-{
-    public AllModelsUnavailableException(string message, IReadOnlyList<Exception> attempts)
-        : base(message, attempts.Count > 0 ? new AggregateException(attempts) : null)
-    {
-        Attempts = attempts;
-    }
-
-    /// <summary>The failure from each endpoint that was attempted for this request.</summary>
-    public IReadOnlyList<Exception> Attempts { get; }
 }

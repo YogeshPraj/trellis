@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.10.0**. 238 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.11.0**. 238 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -25,6 +25,13 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
    then execution.
 3. **SOLID + design patterns.** Every policy decision behind an interface with a default
    implementation (see the routing layer for the house style).
+   **One public type per file, folders map to namespaces.** `Trellis.Agents`,
+   `Trellis.Outputs`, `Trellis.Conversations{.Compaction,.Archive,.Storage}`, `Trellis.Tokens`,
+   `Trellis.Diagnostics`, `Trellis.Tools`; `Trellis.Graph{.Checkpointing,.Resilience,.Diagnostics}`;
+   `Trellis.Routing{.Selection,.Failures,.Health,.Capabilities}`. Exception: a generic type and
+   its same-named non-generic shorthand share a file (`Agent`/`Agent<T>`, `StateGraph`/`StateGraph<T>`).
+   ⚠ The `[Tool]` source generator hardcodes `Trellis.Tools.ToolAttribute` — moving that type
+   silently breaks tool discovery unless the generator is updated with it.
 4. **Abstraction-contract testing, never vendor testing.** Trellis validates against the
    `IChatClient` contract. Provider behavior is the adapter's responsibility — document
    required semantics as opt-in contracts (see `ModelFeatures.ServerConversationState`),
