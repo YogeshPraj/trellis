@@ -6,8 +6,12 @@ using Trellis.State;
 
 namespace Trellis.Conversations.Storage;
 
-/// <summary>The serialized shape of a stored conversation.</summary>
-internal sealed record ConversationSnapshot(
+/// <summary>
+/// The complete persisted state of a conversation — everything an
+/// <see cref="IConversationStore"/> must round-trip. Public because store providers live in
+/// their own assemblies (Redis, Cosmos, and whatever you write next).
+/// </summary>
+public sealed record ConversationSnapshot(
     [property: JsonPropertyName("id")] string Id,
     [property: JsonPropertyName("version")] int Version,
     [property: JsonPropertyName("messages")] IReadOnlyList<ChatMessage> Messages,

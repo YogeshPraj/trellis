@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Trellis.State\Trellis.State.csproj" />
+    <ProjectReference Include="..\Trellis\Trellis.csproj" />
   </ItemGroup>
 
 </Project>

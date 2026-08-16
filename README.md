@@ -568,7 +568,19 @@ IConversationStore store = new TieredConversationStore(
 ]);
 ```
 
-`Trellis.Azure.Cosmos` implements `IAtomicSharedStateStore` using Cosmos **ETags**, so the tiered store's compare-and-swap is genuinely atomic across instances rather than emulated. Increments use the server-side Patch operation, and list appends write one document per entry so an archive isn't capped by the 2&nbsp;MB document limit. The container needs `/pk` as its partition key path, and `DefaultTimeToLive` set if you pass a TTL — the store throws rather than let Cosmos silently ignore expiry you asked for.
+`Trellis.Azure.Cosmos` also ships **`CosmosConversationStore`**, a Cosmos-native conversation schema rather than a blob in a key-value store:
+
+| | Conversation-as-one-document | `CosmosConversationStore` |
+|---|---|---|
+| A turn writes | the entire history, replaced | only its new messages, appended |
+| RU cost at turn 100 | ~100× turn 1 | flat |
+| Ceiling | **2 MB document limit ends the conversation** | none |
+
+One partition per conversation (`/cid`), one immutable document per message (`m-{ordinal}`), and a small head document holding version, counters and the rolling summary. A save appends the new messages and **patches** the head — never replaces it, so the request is charged on the change — and both go in a single `TransactionalBatch` under an ETag precondition, so the turn commits atomically or not at all.
+
+Two properties fall out of the schema: message ids are deterministic, so a replayed save conflicts instead of duplicating; and the head's `messageCount` is the commit point, so messages appended by a save that never committed are simply never read.
+
+`CosmosSharedStateStore` implements `IAtomicSharedStateStore` using Cosmos **ETags**, so the tiered store's compare-and-swap is genuinely atomic across instances rather than emulated. Increments use the server-side Patch operation, and list appends write one document per entry so an archive isn't capped by the 2&nbsp;MB document limit. The container needs `/pk` as its partition key path, and `DefaultTimeToLive` set if you pass a TTL — the store throws rather than let Cosmos silently ignore expiry you asked for.
 
 ## Building
 

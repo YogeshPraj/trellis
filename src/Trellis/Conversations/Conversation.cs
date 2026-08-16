@@ -84,8 +84,25 @@ public sealed class Conversation
         return conversation;
     }
 
-    /// <summary>Records that the store accepted a write at <paramref name="version"/>.</summary>
-    internal void MarkPersisted(int version) => Version = version;
+    /// <summary>
+    /// Records that a store accepted a write at <paramref name="version"/>. Called by
+    /// <see cref="IConversationStore"/> implementations after a successful save; calling it
+    /// yourself desynchronizes the optimistic-concurrency check.
+    /// </summary>
+    public void MarkPersisted(int version) => Version = version;
+
+    /// <summary>Captures this conversation's full state for persistence at <paramref name="version"/>.</summary>
+    public ConversationSnapshot ToSnapshot(int version) =>
+        new(Id, version, Messages, Summary, ContextEpoch, ArchivedCount, LastInputTokenCount);
+
+    /// <summary>Rebuilds a conversation from persisted state.</summary>
+    public static Conversation FromSnapshot(ConversationSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return Restore(
+            snapshot.Id, snapshot.Messages ?? [], snapshot.Summary, snapshot.ContextEpoch,
+            snapshot.ArchivedCount, snapshot.LastInputTokenCount, snapshot.Version);
+    }
 
     /// <summary>
     /// The id sent through <see cref="ChatOptions.ConversationId"/>. Includes the context
