@@ -9,51 +9,56 @@ using Trellis.Conversations.Storage;
 namespace Trellis.Azure.Cosmos;
 
 /// <summary>
-/// Cosmos-native conversation storage: one partition per conversation, one immutable
-/// document per message, and a small head document carrying version and counters.
+/// Append-only Cosmos conversation storage: one partition per conversation, and every change
+/// written as a new document. Nothing is ever replaced, updated, or patched.
 /// </summary>
 /// <remarks>
-/// <para><b>Why not store the conversation as one document</b></para>
+/// <para><b>Why append-only</b></para>
 /// <para>
-/// Rewriting the whole history every turn costs request units proportional to the entire
-/// conversation, so turn 100 costs roughly a hundred times turn 1 — and the 2&#160;MB
-/// document limit eventually ends the conversation outright. Here a turn appends only its new
-/// messages and patches a small head, so cost is flat in conversation length and there is no
-/// ceiling.
+/// Keeping a conversation in one document means every turn rewrites the whole history —
+/// request units proportional to conversation length, and a hard stop at the 2&#160;MB
+/// document limit. Patching a header avoids the rewrite but is still a mutation, and Cosmos
+/// caps a patch at ten operations. Writing only inserts sidesteps all of it: a turn costs
+/// what its new content costs, and a conversation has no length ceiling.
 /// </para>
-/// <para><b>How a save commits</b></para>
+/// <para><b>Concurrency without ETags</b></para>
 /// <para>
-/// Appends and the version bump go into a single <see cref="TransactionalBatch"/> against the
-/// conversation's partition, with the head patched under an ETag precondition. The whole turn
-/// commits or none of it does, and a concurrent writer loses the precondition rather than
-/// interleaving. Message ids are deterministic (<c>m-{ordinal}</c>), so a replayed save
-/// conflicts instead of duplicating, and <see cref="CosmosConversationHead.MessageCount"/> is
-/// the commit point — messages appended by a save that never committed are simply never read.
+/// A commit document's id is <c>v-{version}</c>, so committing version N+1 means inserting a
+/// document only one writer can create. The loser gets a 409 and a
+/// <see cref="ConversationConcurrencyException"/>. Optimistic concurrency falls out of the
+/// unique key — no ETag, no read-modify-write, and the check is the same operation as the
+/// commit.
 /// </para>
-/// <para><b>Container requirements</b></para>
+/// <para><b>Layout of a partition</b></para>
 /// <list type="bullet">
-/// <item>Partition key path <c>/cid</c>.</item>
-/// <item><c>DefaultTimeToLive</c> configured if you pass a <c>timeToLive</c>, otherwise Cosmos
-/// ignores per-item expiry silently — this store throws instead.</item>
+/// <item><c>m-{ordinal}</c> — one message, immutable. Deterministic id, so a replayed append
+/// conflicts rather than duplicating.</item>
+/// <item><c>v-{version}</c> — the metadata committed by one turn: counters, epoch, usage.
+/// Small, and the newest one is the conversation's current state.</item>
+/// <item><c>s-{epoch}</c> — a rolling summary, written only when compaction produces a new
+/// one, so ordinary turns never rewrite it.</item>
 /// </list>
+/// <para>
+/// A save that dies after appending messages but before its commit leaves documents no reader
+/// will ever look at: reads are bounded by the newest commit's <c>messageCount</c>. Nothing
+/// needs cleaning up, and the retry re-creates the same ids harmlessly.
+/// </para>
+/// <para><b>Container requirements:</b> partition key path <c>/cid</c>, and
+/// <c>DefaultTimeToLive</c> configured if a <c>timeToLive</c> is supplied.</para>
 /// </remarks>
 public sealed class CosmosConversationStore : IConversationStore
 {
-    private const string HeadId = "head";
-    private const string MessagePrefix = "m-";
-
-    /// <summary>A batch is capped at 100 operations; the head patch takes one of them.</summary>
+    /// <summary>A transactional batch is capped at 100 operations; the commit takes one.</summary>
     private const int MaxAppendsPerBatch = 99;
 
     private readonly Container _container;
     private readonly TimeSpan? _timeToLive;
-    private readonly bool _timeToLiveEnabled;
 
     /// <param name="container">Container partitioned on <c>/cid</c>; the caller owns its lifetime.</param>
     /// <param name="timeToLive">Expiry for a conversation's documents; null keeps them forever.</param>
     /// <param name="timeToLiveEnabled">
-    /// Whether the container has <c>DefaultTimeToLive</c> set. Leave true if it does; false
-    /// makes a TTL request fail loudly rather than be dropped by Cosmos.
+    /// Whether the container has <c>DefaultTimeToLive</c> set. False makes a TTL request fail
+    /// loudly rather than be silently dropped by Cosmos.
     /// </param>
     public CosmosConversationStore(Container container, TimeSpan? timeToLive = null, bool timeToLiveEnabled = true)
     {
@@ -67,32 +72,29 @@ public sealed class CosmosConversationStore : IConversationStore
         }
         _container = container;
         _timeToLive = timeToLive;
-        _timeToLiveEnabled = timeToLiveEnabled;
     }
 
     public async ValueTask<Conversation?> LoadAsync(string conversationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(conversationId);
 
-        (CosmosConversationHead? head, _) = await ReadHeadAsync(conversationId, cancellationToken).ConfigureAwait(false);
-        if (head is null)
+        CosmosConversationCommit? commit = await ReadLatestCommitAsync(conversationId, cancellationToken)
+            .ConfigureAwait(false);
+        if (commit is null)
         {
             return null;
         }
 
-        // Only the hot tail is read: everything below ArchivedCount was compacted away, and
-        // anything at or above MessageCount belongs to a save that never committed.
+        string? summary = commit.ContextEpoch > 0
+            ? await ReadSummaryAsync(conversationId, commit.ContextEpoch, cancellationToken).ConfigureAwait(false)
+            : null;
+
         List<ChatMessage> messages = await ReadMessagesAsync(
-            conversationId, head.ArchivedCount, head.MessageCount, cancellationToken).ConfigureAwait(false);
+            conversationId, commit.ArchivedCount, commit.MessageCount, cancellationToken).ConfigureAwait(false);
 
         return Conversation.FromSnapshot(new ConversationSnapshot(
-            head.ConversationId,
-            head.Version,
-            messages,
-            head.Summary,
-            head.ContextEpoch,
-            head.ArchivedCount,
-            head.LastInputTokenCount));
+            conversationId, commit.Version, messages, summary,
+            commit.ContextEpoch, commit.ArchivedCount, commit.LastInputTokenCount));
     }
 
     public async ValueTask SaveAsync(Conversation conversation, CancellationToken cancellationToken = default)
@@ -100,52 +102,74 @@ public sealed class CosmosConversationStore : IConversationStore
         ArgumentNullException.ThrowIfNull(conversation);
         string conversationId = conversation.Id;
 
-        (CosmosConversationHead? head, string? etag) =
-            await ReadHeadAsync(conversationId, cancellationToken).ConfigureAwait(false);
-
-        int storedVersion = head?.Version ?? 0;
+        CosmosConversationCommit? latest = await ReadLatestCommitAsync(conversationId, cancellationToken)
+            .ConfigureAwait(false);
+        int storedVersion = latest?.Version ?? 0;
         if (storedVersion != conversation.Version)
         {
             throw new ConversationConcurrencyException(conversationId, conversation.Version, storedVersion);
         }
 
         int nextVersion = conversation.Version + 1;
-        int committed = head?.MessageCount ?? 0;
+        int committed = latest?.MessageCount ?? 0;
         int total = conversation.ArchivedCount + conversation.Messages.Count;
 
-        // Messages whose ordinal we no longer hold — compacted away before they were ever
-        // persisted — cannot be appended; the summary is what carries them from here.
+        // Ordinals below ArchivedCount were compacted out of the live conversation, so if they
+        // were never persisted they cannot be now — the summary is what carries them forward.
         int firstAppendable = Math.Max(committed, conversation.ArchivedCount);
-        List<CosmosConversationMessage> appends = [];
+        List<CosmosConversationDocument> appends = [];
         for (int ordinal = firstAppendable; ordinal < total; ordinal++)
         {
-            ChatMessage message = conversation.Messages[ordinal - conversation.ArchivedCount];
             appends.Add(new CosmosConversationMessage
             {
                 Id = MessageId(ordinal),
                 ConversationId = conversationId,
+                Type = CosmosConversationDocumentTypes.Message,
                 Ordinal = ordinal,
-                Message = JsonSerializer.Serialize(message, AIJsonUtilities.DefaultOptions),
+                Message = JsonSerializer.Serialize(
+                    conversation.Messages[ordinal - conversation.ArchivedCount], AIJsonUtilities.DefaultOptions),
                 TimeToLiveSeconds = TimeToLiveSeconds(),
             });
         }
 
-        // Appends beyond one batch are committed in idempotent chunks; the head patch in the
-        // final batch is the commit point, so a crash midway leaves unreferenced messages
-        // that the next attempt re-creates harmlessly and no reader ever sees.
-        for (int offset = 0; offset < appends.Count - MaxAppendsPerBatch; offset += MaxAppendsPerBatch)
+        // Only a compaction produces a new summary, so ordinary turns write no summary at all.
+        if (conversation.Summary is string summary && conversation.ContextEpoch > (latest?.ContextEpoch ?? 0))
         {
-            await ExecuteAsync(
-                conversationId,
-                appends.Skip(offset).Take(MaxAppendsPerBatch),
-                head: null, etag: null, nextVersion, total, conversation, cancellationToken).ConfigureAwait(false);
+            appends.Add(new CosmosConversationSummary
+            {
+                Id = SummaryId(conversation.ContextEpoch),
+                ConversationId = conversationId,
+                Type = CosmosConversationDocumentTypes.Summary,
+                ContextEpoch = conversation.ContextEpoch,
+                Summary = summary,
+                TimeToLiveSeconds = TimeToLiveSeconds(),
+            });
         }
 
-        IEnumerable<CosmosConversationMessage> finalChunk = appends.Count > MaxAppendsPerBatch
-            ? appends.Skip((appends.Count - 1) / MaxAppendsPerBatch * MaxAppendsPerBatch)
-            : appends;
+        var commit = new CosmosConversationCommit
+        {
+            Id = CommitId(nextVersion),
+            ConversationId = conversationId,
+            Type = CosmosConversationDocumentTypes.Commit,
+            Version = nextVersion,
+            MessageCount = total,
+            ArchivedCount = conversation.ArchivedCount,
+            ContextEpoch = conversation.ContextEpoch,
+            LastInputTokenCount = conversation.LastInputTokenCount,
+            TimeToLiveSeconds = TimeToLiveSeconds(),
+        };
 
-        await ExecuteAsync(conversationId, finalChunk, head, etag, nextVersion, total, conversation, cancellationToken)
+        // Appends beyond one batch go first, uncommitted; the batch carrying the commit
+        // document is the point at which any of it becomes visible.
+        for (int offset = 0; offset + MaxAppendsPerBatch < appends.Count; offset += MaxAppendsPerBatch)
+        {
+            await ExecuteAsync(
+                conversationId, appends.Skip(offset).Take(MaxAppendsPerBatch), commit: null,
+                conversation.Version, cancellationToken).ConfigureAwait(false);
+        }
+
+        int tail = appends.Count == 0 ? 0 : (appends.Count - 1) / MaxAppendsPerBatch * MaxAppendsPerBatch;
+        await ExecuteAsync(conversationId, appends.Skip(tail), commit, conversation.Version, cancellationToken)
             .ConfigureAwait(false);
 
         conversation.MarkPersisted(nextVersion);
@@ -156,58 +180,51 @@ public sealed class CosmosConversationStore : IConversationStore
         ArgumentException.ThrowIfNullOrEmpty(conversationId);
         var partition = new PartitionKey(conversationId);
 
-        (CosmosConversationHead? head, _) = await ReadHeadAsync(conversationId, cancellationToken).ConfigureAwait(false);
-        if (head is null)
-        {
-            return;
-        }
+        // Deleting is the one operation that cannot be an append. Every document id in the
+        // partition is queried rather than derived, so orphans from uncommitted saves go too.
+        var query = new QueryDefinition("SELECT c.id FROM c WHERE c.cid = @cid").WithParameter("@cid", conversationId);
+        using FeedIterator<CosmosIdProjection> iterator = _container.GetItemQueryIterator<CosmosIdProjection>(
+            query, requestOptions: new QueryRequestOptions { PartitionKey = partition });
 
-        // Head first: once it is gone the conversation reads as absent, so a failure partway
-        // through leaves unreachable documents rather than a half-readable conversation.
-        await DeleteIfPresentAsync(HeadId, partition, cancellationToken).ConfigureAwait(false);
-        for (int ordinal = 0; ordinal < head.MessageCount; ordinal++)
+        while (iterator.HasMoreResults)
         {
-            await DeleteIfPresentAsync(MessageId(ordinal), partition, cancellationToken).ConfigureAwait(false);
+            foreach (CosmosIdProjection item in await iterator.ReadNextAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (item.Id is null)
+                {
+                    continue;
+                }
+                try
+                {
+                    await _container.DeleteItemAsync<object>(item.Id, partition, cancellationToken: cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+                {
+                }
+            }
         }
     }
 
     private async Task ExecuteAsync(
         string conversationId,
-        IEnumerable<CosmosConversationMessage> appends,
-        CosmosConversationHead? head,
-        string? etag,
-        int nextVersion,
-        int total,
-        Conversation conversation,
+        IEnumerable<CosmosConversationDocument> appends,
+        CosmosConversationCommit? commit,
+        int expectedVersion,
         CancellationToken cancellationToken)
     {
-        var partition = new PartitionKey(conversationId);
-        TransactionalBatch batch = _container.CreateTransactionalBatch(partition);
+        TransactionalBatch batch = _container.CreateTransactionalBatch(new PartitionKey(conversationId));
         bool any = false;
-
-        foreach (CosmosConversationMessage message in appends)
+        foreach (CosmosConversationDocument document in appends)
         {
-            batch.CreateItem(message);
+            batch.CreateItem(document);
             any = true;
         }
-
-        bool commit = head is not null || etag is null;
-        if (commit)
+        if (commit is not null)
         {
-            if (head is null)
-            {
-                batch.CreateItem(NewHead(conversationId, nextVersion, total, conversation));
-            }
-            else
-            {
-                batch.PatchItem(
-                    HeadId,
-                    HeadPatch(nextVersion, total, conversation),
-                    new TransactionalBatchPatchItemRequestOptions { IfMatchEtag = etag });
-            }
+            batch.CreateItem(commit);
             any = true;
         }
-
         if (!any)
         {
             return;
@@ -219,13 +236,13 @@ public sealed class CosmosConversationStore : IConversationStore
             return;
         }
 
-        // A lost ETag race, or a message id that already exists because another writer got
-        // there first: both mean this copy was stale.
-        if (response.StatusCode is HttpStatusCode.PreconditionFailed or HttpStatusCode.Conflict)
+        // A 409 means a document we tried to create already exists — for the commit that is
+        // exactly the concurrency check: another writer took this version first.
+        if (response.StatusCode == HttpStatusCode.Conflict)
         {
-            (CosmosConversationHead? latest, _) = await ReadHeadAsync(conversationId, cancellationToken)
+            CosmosConversationCommit? latest = await ReadLatestCommitAsync(conversationId, cancellationToken)
                 .ConfigureAwait(false);
-            throw new ConversationConcurrencyException(conversationId, conversation.Version, latest?.Version ?? 0);
+            throw new ConversationConcurrencyException(conversationId, expectedVersion, latest?.Version ?? 0);
         }
 
         throw new CosmosException(
@@ -233,44 +250,40 @@ public sealed class CosmosConversationStore : IConversationStore
             response.StatusCode, 0, response.ActivityId, response.RequestCharge);
     }
 
-    /// <summary>Only the fields a turn can change, so the request is charged on the change.</summary>
-    private List<PatchOperation> HeadPatch(int nextVersion, int total, Conversation conversation) =>
-    [
-        PatchOperation.Set("/version", nextVersion),
-        PatchOperation.Set("/messageCount", total),
-        PatchOperation.Set("/archived", conversation.ArchivedCount),
-        PatchOperation.Set("/epoch", conversation.ContextEpoch),
-        PatchOperation.Set("/summary", conversation.Summary),
-        PatchOperation.Set("/lastInputTokens", conversation.LastInputTokenCount),
-    ];
-
-    private CosmosConversationHead NewHead(string conversationId, int version, int total, Conversation conversation) =>
-        new()
-        {
-            Id = HeadId,
-            ConversationId = conversationId,
-            Version = version,
-            MessageCount = total,
-            ArchivedCount = conversation.ArchivedCount,
-            ContextEpoch = conversation.ContextEpoch,
-            Summary = conversation.Summary,
-            LastInputTokenCount = conversation.LastInputTokenCount,
-            TimeToLiveSeconds = TimeToLiveSeconds(),
-        };
-
-    private async ValueTask<(CosmosConversationHead? Head, string? ETag)> ReadHeadAsync(
+    private async Task<CosmosConversationCommit?> ReadLatestCommitAsync(
         string conversationId, CancellationToken cancellationToken)
+    {
+        var query = new QueryDefinition(
+            "SELECT TOP 1 * FROM c WHERE c.cid = @cid AND c.type = @type ORDER BY c.version DESC")
+            .WithParameter("@cid", conversationId)
+            .WithParameter("@type", CosmosConversationDocumentTypes.Commit);
+
+        using FeedIterator<CosmosConversationCommit> iterator = _container.GetItemQueryIterator<CosmosConversationCommit>(
+            query, requestOptions: new QueryRequestOptions { PartitionKey = new PartitionKey(conversationId) });
+
+        while (iterator.HasMoreResults)
+        {
+            foreach (CosmosConversationCommit commit in await iterator.ReadNextAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return commit;
+            }
+        }
+        return null;
+    }
+
+    private async Task<string?> ReadSummaryAsync(string conversationId, int epoch, CancellationToken cancellationToken)
     {
         try
         {
-            ItemResponse<CosmosConversationHead> response = await _container
-                .ReadItemAsync<CosmosConversationHead>(HeadId, new PartitionKey(conversationId), cancellationToken: cancellationToken)
+            ItemResponse<CosmosConversationSummary> response = await _container
+                .ReadItemAsync<CosmosConversationSummary>(
+                    SummaryId(epoch), new PartitionKey(conversationId), cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
-            return (response.Resource, response.ETag);
+            return response.Resource?.Summary;
         }
         catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
         {
-            return (null, null);
+            return null;
         }
     }
 
@@ -284,8 +297,10 @@ public sealed class CosmosConversationStore : IConversationStore
         }
 
         var query = new QueryDefinition(
-            "SELECT c.message FROM c WHERE c.cid = @cid AND c.ordinal >= @from AND c.ordinal < @to ORDER BY c.ordinal")
+            "SELECT c.message FROM c WHERE c.cid = @cid AND c.type = @type " +
+            "AND c.ordinal >= @from AND c.ordinal < @to ORDER BY c.ordinal")
             .WithParameter("@cid", conversationId)
+            .WithParameter("@type", CosmosConversationDocumentTypes.Message)
             .WithParameter("@from", fromOrdinal)
             .WithParameter("@to", toOrdinal);
 
@@ -306,24 +321,14 @@ public sealed class CosmosConversationStore : IConversationStore
         return messages;
     }
 
-    private async Task DeleteIfPresentAsync(string id, PartitionKey partition, CancellationToken cancellationToken)
-    {
-        try
-        {
-            await _container.DeleteItemAsync<object>(id, partition, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (CosmosException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
-        {
-        }
-    }
-
     private int? TimeToLiveSeconds() =>
-        _timeToLive is TimeSpan ttl && _timeToLiveEnabled ? Math.Max(1, (int)ttl.TotalSeconds) : null;
+        _timeToLive is TimeSpan ttl ? Math.Max(1, (int)ttl.TotalSeconds) : null;
 
-    /// <summary>Zero-padded so ids sort in ordinal order, and deterministic so appends are idempotent.</summary>
-    private static string MessageId(int ordinal) =>
-        MessagePrefix + ordinal.ToString("D9", CultureInfo.InvariantCulture);
+    private static string MessageId(int ordinal) => "m-" + ordinal.ToString("D9", CultureInfo.InvariantCulture);
+
+    private static string CommitId(int version) => "v-" + version.ToString("D9", CultureInfo.InvariantCulture);
+
+    private static string SummaryId(int epoch) => "s-" + epoch.ToString("D9", CultureInfo.InvariantCulture);
 }
 
 /// <summary>Query projection for reading a conversation's messages.</summary>

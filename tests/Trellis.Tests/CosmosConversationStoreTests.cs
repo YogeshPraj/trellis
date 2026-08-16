@@ -2,40 +2,38 @@ using System.Net;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Extensions.AI;
 using NSubstitute;
-using NSubstitute.ExceptionExtensions;
 using Trellis.Azure.Cosmos;
 
 namespace Trellis.Tests;
 
 /// <summary>
-/// Contract tests for the append-only Cosmos conversation schema: that a turn appends new
-/// messages rather than rewriting history, that the head is patched (not replaced) under an
-/// ETag precondition, and that both commit in one transactional batch. Cosmos's own storage
-/// behaviour belongs to the SDK, so the container is substituted.
+/// Contract tests for the append-only Cosmos conversation schema: that a turn writes nothing
+/// but inserts, that the commit document's unique id is what detects a concurrent writer, and
+/// that history is never rewritten. Cosmos's storage behaviour belongs to the SDK, so the
+/// container is substituted.
 /// </summary>
 public class CosmosConversationStoreTests
 {
+    /// <summary>Captures what a save puts in its transactional batch.</summary>
     private sealed class BatchRecorder
     {
         public List<object> Created { get; } = [];
 
-        public List<(string Id, IReadOnlyList<PatchOperation> Ops, string? ETag)> Patched { get; } = [];
+        public int ReplaceCalls { get; private set; }
+
+        public int PatchCalls { get; private set; }
 
         public TransactionalBatch Batch { get; }
 
-        public BatchRecorder(HttpStatusCode status = HttpStatusCode.OK)
+        public BatchRecorder(HttpStatusCode status)
         {
             Batch = Substitute.For<TransactionalBatch>();
             Batch.CreateItem(Arg.Any<object>(), Arg.Any<TransactionalBatchItemRequestOptions>())
                 .Returns(call => { Created.Add(call.ArgAt<object>(0)); return Batch; });
+            Batch.ReplaceItem(Arg.Any<string>(), Arg.Any<object>(), Arg.Any<TransactionalBatchItemRequestOptions>())
+                .Returns(_ => { ReplaceCalls++; return Batch; });
             Batch.PatchItem(Arg.Any<string>(), Arg.Any<IReadOnlyList<PatchOperation>>(), Arg.Any<TransactionalBatchPatchItemRequestOptions>())
-                .Returns(call =>
-                {
-                    Patched.Add((call.ArgAt<string>(0),
-                                 call.ArgAt<IReadOnlyList<PatchOperation>>(1),
-                                 call.ArgAt<TransactionalBatchPatchItemRequestOptions>(2)?.IfMatchEtag));
-                    return Batch;
-                });
+                .Returns(_ => { PatchCalls++; return Batch; });
 
             TransactionalBatchResponse response = Substitute.For<TransactionalBatchResponse>();
             response.IsSuccessStatusCode.Returns(status == HttpStatusCode.OK);
@@ -44,166 +42,209 @@ public class CosmosConversationStoreTests
         }
     }
 
-    private static ItemResponse<T> Response<T>(T resource, string? etag = null)
+    /// <summary>Feeds a single page of results to one typed query iterator.</summary>
+    private static FeedIterator<T> Page<T>(IReadOnlyList<T> items)
     {
-        ItemResponse<T> response = Substitute.For<ItemResponse<T>>();
-        response.Resource.Returns(resource);
-        response.ETag.Returns(etag);
-        return response;
+        FeedIterator<T> iterator = Substitute.For<FeedIterator<T>>();
+        bool served = false;
+        iterator.HasMoreResults.Returns(_ => !served);
+        FeedResponse<T> response = Substitute.For<FeedResponse<T>>();
+        response.GetEnumerator().Returns(_ => items.GetEnumerator());
+        iterator.ReadNextAsync(Arg.Any<CancellationToken>())
+            .Returns(_ => { served = true; return Task.FromResult(response); });
+        return iterator;
     }
 
-    private static CosmosException NotFound() => new("not found", HttpStatusCode.NotFound, 0, "a", 1);
-
     private static (Container Container, BatchRecorder Recorder) NewContainer(
-        CosmosConversationHead? head, string? etag = null, HttpStatusCode batchStatus = HttpStatusCode.OK)
+        CosmosConversationCommit? latestCommit,
+        IReadOnlyList<CosmosMessageProjection>? messages = null,
+        HttpStatusCode batchStatus = HttpStatusCode.OK)
     {
         Container container = Substitute.For<Container>();
-        if (head is null)
-        {
-            container.ReadItemAsync<CosmosConversationHead>(
-                    Arg.Any<string>(), Arg.Any<PartitionKey>(), Arg.Any<ItemRequestOptions>(), Arg.Any<CancellationToken>())
-                .ThrowsAsyncForAnyArgs(NotFound());
-        }
-        else
-        {
-            container.ReadItemAsync<CosmosConversationHead>(
-                    Arg.Any<string>(), Arg.Any<PartitionKey>(), Arg.Any<ItemRequestOptions>(), Arg.Any<CancellationToken>())
-                .ReturnsForAnyArgs(_ => Task.FromResult(Response(head, etag)));
-        }
+        container.GetItemQueryIterator<CosmosConversationCommit>(
+                Arg.Any<QueryDefinition>(), Arg.Any<string>(), Arg.Any<QueryRequestOptions>())
+            .ReturnsForAnyArgs(_ => Page<CosmosConversationCommit>(
+                latestCommit is null ? [] : [latestCommit]));
+        container.GetItemQueryIterator<CosmosMessageProjection>(
+                Arg.Any<QueryDefinition>(), Arg.Any<string>(), Arg.Any<QueryRequestOptions>())
+            .ReturnsForAnyArgs(_ => Page(messages ?? []));
 
         var recorder = new BatchRecorder(batchStatus);
         container.CreateTransactionalBatch(Arg.Any<PartitionKey>()).ReturnsForAnyArgs(recorder.Batch);
         return (container, recorder);
     }
 
-    private static Conversation ConversationWith(string id, params string[] texts)
+    private static Conversation ConversationWith(string id, int persistedVersion, params string[] texts)
     {
         var conversation = new Conversation(id);
         foreach (string text in texts)
         {
             conversation.Add(new ChatMessage(ChatRole.User, text));
         }
+        conversation.MarkPersisted(persistedVersion);
         return conversation;
     }
 
     [Fact]
-    public async Task FirstSave_CreatesHeadAndEveryMessage()
+    public async Task ASaveWritesNothingButInserts()
     {
-        (Container container, BatchRecorder recorder) = NewContainer(head: null);
+        (Container container, BatchRecorder recorder) = NewContainer(latestCommit: null);
         var store = new CosmosConversationStore(container);
 
-        await store.SaveAsync(ConversationWith("c1", "one", "two"));
+        await store.SaveAsync(ConversationWith("c1", 0, "one", "two"));
 
-        var messages = recorder.Created.OfType<CosmosConversationMessage>().ToList();
-        Assert.Equal(2, messages.Count);
-        Assert.Equal(["m-000000000", "m-000000001"], messages.Select(m => m.Id));
-        Assert.All(messages, m => Assert.Equal("c1", m.ConversationId));
-
-        // No head exists yet, so it is created rather than patched.
-        CosmosConversationHead head = Assert.Single(recorder.Created.OfType<CosmosConversationHead>());
-        Assert.Equal(1, head.Version);
-        Assert.Equal(2, head.MessageCount);
-        Assert.Empty(recorder.Patched);
+        // The whole point of the schema: no replace, no patch, anywhere.
+        Assert.Equal(0, recorder.ReplaceCalls);
+        Assert.Equal(0, recorder.PatchCalls);
+        Assert.NotEmpty(recorder.Created);
     }
 
     [Fact]
-    public async Task SubsequentTurn_AppendsOnlyNewMessages_AndPatchesTheHead()
+    public async Task FirstSave_InsertsEveryMessageAndOneCommit()
     {
-        var head = new CosmosConversationHead
-        {
-            ConversationId = "c1", Version = 1, MessageCount = 2, ArchivedCount = 0,
-        };
-        (Container container, BatchRecorder recorder) = NewContainer(head, etag: "etag-1");
+        (Container container, BatchRecorder recorder) = NewContainer(latestCommit: null);
         var store = new CosmosConversationStore(container);
 
-        Conversation conversation = ConversationWith("c1", "one", "two", "three");
-        conversation.MarkPersisted(1);
+        await store.SaveAsync(ConversationWith("c1", 0, "one", "two"));
 
-        await store.SaveAsync(conversation);
+        var messages = recorder.Created.OfType<CosmosConversationMessage>().ToList();
+        Assert.Equal(["m-000000000", "m-000000001"], messages.Select(m => m.Id));
 
-        // The two existing messages are untouched — this is the whole point of the schema.
+        CosmosConversationCommit commit = Assert.Single(recorder.Created.OfType<CosmosConversationCommit>());
+        Assert.Equal("v-000000001", commit.Id);
+        Assert.Equal(1, commit.Version);
+        Assert.Equal(2, commit.MessageCount);
+    }
+
+    [Fact]
+    public async Task SubsequentTurn_AppendsOnlyTheNewMessages()
+    {
+        var latest = new CosmosConversationCommit { Version = 1, MessageCount = 2, ArchivedCount = 0 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var store = new CosmosConversationStore(container);
+
+        await store.SaveAsync(ConversationWith("c1", 1, "one", "two", "three"));
+
+        // History is untouched — only ordinal 2 is written.
         CosmosConversationMessage appended = Assert.Single(recorder.Created.OfType<CosmosConversationMessage>());
         Assert.Equal("m-000000002", appended.Id);
         Assert.Equal(2, appended.Ordinal);
 
-        // The head is patched, not replaced, and only under the ETag we read.
-        (string id, IReadOnlyList<PatchOperation> ops, string? etag) = Assert.Single(recorder.Patched);
-        Assert.Equal("head", id);
-        Assert.Equal("etag-1", etag);
-        Assert.Contains(ops, o => o.Path == "/version");
-        Assert.Contains(ops, o => o.Path == "/messageCount");
-        Assert.Empty(recorder.Created.OfType<CosmosConversationHead>());
+        CosmosConversationCommit commit = Assert.Single(recorder.Created.OfType<CosmosConversationCommit>());
+        Assert.Equal(2, commit.Version);
+        Assert.Equal(3, commit.MessageCount);
+    }
+
+    [Fact]
+    public async Task OrdinaryTurn_WritesNoSummaryDocument()
+    {
+        var latest = new CosmosConversationCommit { Version = 1, MessageCount = 1, ContextEpoch = 0 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var store = new CosmosConversationStore(container);
+
+        await store.SaveAsync(ConversationWith("c1", 1, "one", "two"));
+
+        // An unchanged summary must never be rewritten — that is the write amplification the
+        // schema exists to avoid.
+        Assert.Empty(recorder.Created.OfType<CosmosConversationSummary>());
+    }
+
+    [Fact]
+    public async Task Compaction_WritesTheSummaryOnceForItsEpoch()
+    {
+        var latest = new CosmosConversationCommit { Version = 3, MessageCount = 10, ArchivedCount = 0, ContextEpoch = 0 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var store = new CosmosConversationStore(container);
+
+        Conversation compacted = Conversation.FromSnapshot(new ConversationSnapshot(
+            "c1", 3, [new ChatMessage(ChatRole.User, "ten")], "the summary",
+            ContextEpoch: 1, ArchivedCount: 9, LastInputTokenCount: null));
+
+        await store.SaveAsync(compacted);
+
+        CosmosConversationSummary summary = Assert.Single(recorder.Created.OfType<CosmosConversationSummary>());
+        Assert.Equal("s-000000001", summary.Id);
+        Assert.Equal("the summary", summary.Summary);
+    }
+
+    [Fact]
+    public async Task StaleCopy_IsRejectedBeforeAnythingIsWritten()
+    {
+        var latest = new CosmosConversationCommit { Version = 7, MessageCount = 3 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var store = new CosmosConversationStore(container);
+
+        var ex = await Assert.ThrowsAsync<ConversationConcurrencyException>(
+            () => store.SaveAsync(ConversationWith("c1", 2, "one")).AsTask());
+
+        Assert.Equal(2, ex.ExpectedVersion);
+        Assert.Equal(7, ex.ActualVersion);
+        Assert.Empty(recorder.Created);
+    }
+
+    [Fact]
+    public async Task LosingTheCommitId_IsTheConcurrencyCheck()
+    {
+        // Another writer created v-000000002 first, so our insert conflicts.
+        var latest = new CosmosConversationCommit { Version = 1, MessageCount = 1 };
+        (Container container, _) = NewContainer(latest, batchStatus: HttpStatusCode.Conflict);
+        var store = new CosmosConversationStore(container);
+
+        await Assert.ThrowsAsync<ConversationConcurrencyException>(
+            () => store.SaveAsync(ConversationWith("c1", 1, "one", "two")).AsTask());
     }
 
     [Fact]
     public async Task SaveAdvancesTheConversationVersion()
     {
-        var head = new CosmosConversationHead { ConversationId = "c1", Version = 4, MessageCount = 1 };
-        (Container container, _) = NewContainer(head, etag: "e");
+        var latest = new CosmosConversationCommit { Version = 4, MessageCount = 1 };
+        (Container container, _) = NewContainer(latest);
         var store = new CosmosConversationStore(container);
 
-        Conversation conversation = ConversationWith("c1", "one", "two");
-        conversation.MarkPersisted(4);
-
+        Conversation conversation = ConversationWith("c1", 4, "one", "two");
         await store.SaveAsync(conversation);
 
         Assert.Equal(5, conversation.Version);
     }
 
     [Fact]
-    public async Task StaleCopy_IsRejectedBeforeAnyWrite()
-    {
-        var head = new CosmosConversationHead { ConversationId = "c1", Version = 7, MessageCount = 3 };
-        (Container container, BatchRecorder recorder) = NewContainer(head, etag: "e");
-        var store = new CosmosConversationStore(container);
-
-        Conversation stale = ConversationWith("c1", "one");
-        stale.MarkPersisted(2);
-
-        var ex = await Assert.ThrowsAsync<ConversationConcurrencyException>(() => store.SaveAsync(stale).AsTask());
-
-        Assert.Equal(2, ex.ExpectedVersion);
-        Assert.Equal(7, ex.ActualVersion);
-        Assert.Empty(recorder.Created);
-        Assert.Empty(recorder.Patched);
-    }
-
-    [Fact]
-    public async Task LostETagRace_SurfacesAsAConcurrencyConflict()
-    {
-        var head = new CosmosConversationHead { ConversationId = "c1", Version = 1, MessageCount = 1 };
-        (Container container, _) = NewContainer(head, etag: "e", batchStatus: HttpStatusCode.PreconditionFailed);
-        var store = new CosmosConversationStore(container);
-
-        Conversation conversation = ConversationWith("c1", "one", "two");
-        conversation.MarkPersisted(1);
-
-        await Assert.ThrowsAsync<ConversationConcurrencyException>(() => store.SaveAsync(conversation).AsTask());
-    }
-
-    [Fact]
     public async Task UnknownConversation_LoadsAsNull()
     {
-        (Container container, _) = NewContainer(head: null);
+        (Container container, _) = NewContainer(latestCommit: null);
 
         Assert.Null(await new CosmosConversationStore(container).LoadAsync("missing"));
     }
 
     [Fact]
+    public async Task Load_ReadsTheCommittedWindowOfMessages()
+    {
+        var latest = new CosmosConversationCommit { Version = 2, MessageCount = 2, ArchivedCount = 0 };
+        string one = System.Text.Json.JsonSerializer.Serialize(
+            new ChatMessage(ChatRole.User, "one"), AIJsonUtilities.DefaultOptions);
+        string two = System.Text.Json.JsonSerializer.Serialize(
+            new ChatMessage(ChatRole.Assistant, "two"), AIJsonUtilities.DefaultOptions);
+        (Container container, _) = NewContainer(latest,
+            messages: [new CosmosMessageProjection { Message = one }, new CosmosMessageProjection { Message = two }]);
+
+        Conversation loaded = (await new CosmosConversationStore(container).LoadAsync("c1"))!;
+
+        Assert.Equal(2, loaded.Version);
+        Assert.Equal(["one", "two"], loaded.Messages.Select(m => m.Text));
+        Assert.Equal(ChatRole.Assistant, loaded.Messages[1].Role);
+    }
+
+    [Fact]
     public async Task CompactedConversation_AppendsFromTheHotTailOnly()
     {
-        // 10 messages committed, 8 compacted away: the live conversation holds ordinals 8-9
-        // plus one new turn, and only the new one is appendable.
-        var head = new CosmosConversationHead
+        var latest = new CosmosConversationCommit
         {
-            ConversationId = "c1", Version = 3, MessageCount = 10, ArchivedCount = 8, Summary = "earlier",
+            Version = 3, MessageCount = 10, ArchivedCount = 8, ContextEpoch = 1,
         };
-        (Container container, BatchRecorder recorder) = NewContainer(head, etag: "e");
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
         var store = new CosmosConversationStore(container);
 
         Conversation conversation = Conversation.FromSnapshot(new ConversationSnapshot(
-            "c1", 3,
-            [new ChatMessage(ChatRole.User, "nine"), new ChatMessage(ChatRole.User, "ten")],
+            "c1", 3, [new ChatMessage(ChatRole.User, "nine"), new ChatMessage(ChatRole.User, "ten")],
             "earlier", ContextEpoch: 1, ArchivedCount: 8, LastInputTokenCount: null));
         conversation.Add(new ChatMessage(ChatRole.User, "eleven"));
 
@@ -221,22 +262,5 @@ public class CosmosConversationStoreTests
         var ex = Assert.Throws<ArgumentException>(() =>
             new CosmosConversationStore(container, TimeSpan.FromHours(1), timeToLiveEnabled: false));
         Assert.Contains("DefaultTimeToLive", ex.Message);
-    }
-
-    [Fact]
-    public async Task NoNewMessages_StillCommitsTheHeadPatch()
-    {
-        var head = new CosmosConversationHead { ConversationId = "c1", Version = 1, MessageCount = 1 };
-        (Container container, BatchRecorder recorder) = NewContainer(head, etag: "e");
-        var store = new CosmosConversationStore(container);
-
-        // A compaction-only save changes the summary and epoch without adding messages.
-        Conversation conversation = ConversationWith("c1", "one");
-        conversation.MarkPersisted(1);
-
-        await store.SaveAsync(conversation);
-
-        Assert.Empty(recorder.Created.OfType<CosmosConversationMessage>());
-        Assert.Single(recorder.Patched);
     }
 }

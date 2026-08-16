@@ -469,7 +469,9 @@ public class TieredConversationStoreTests
             options ?? new TieredConversationStoreOptions
             {
                 ReplicationMode = ReplicationMode.WriteBehind,
-                FlushInterval = TimeSpan.FromMilliseconds(20),
+                // Long interval so the background flusher never races the test: every case
+                // drives replication explicitly through FlushAsync or DisposeAsync.
+                FlushInterval = TimeSpan.FromMinutes(10),
                 UnhealthyCooldown = TimeSpan.FromMilliseconds(50),
                 MaxUnhealthyCooldown = TimeSpan.FromMilliseconds(50),
             });

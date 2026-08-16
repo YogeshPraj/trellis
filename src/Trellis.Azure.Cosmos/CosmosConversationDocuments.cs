@@ -3,74 +3,30 @@ using Newtonsoft.Json;
 
 namespace Trellis.Azure.Cosmos;
 
-/// <summary>
-/// The mutable head of a conversation: version, counters, and the rolling summary. Small on
-/// purpose — it is the only document a turn touches more than once, and it is patched rather
-/// than replaced so the request is charged on the change, not on the document.
-/// </summary>
-/// <remarks>
-/// Carries both Newtonsoft and System.Text.Json attributes because the Cosmos SDK serializes
-/// with Newtonsoft unless the application installs a custom <c>CosmosSerializer</c>.
-/// </remarks>
-public sealed class CosmosConversationHead
+/// <summary>Document kinds inside a conversation's partition.</summary>
+public static class CosmosConversationDocumentTypes
 {
-    /// <summary>Always <c>head</c>: one per conversation partition.</summary>
-    [JsonProperty("id")]
-    [JsonPropertyName("id")]
-    public string Id { get; set; } = "head";
+    /// <summary>A single message of the conversation.</summary>
+    public const string Message = "message";
 
-    /// <summary>Partition key — the conversation id, so one conversation is one partition.</summary>
-    [JsonProperty("cid")]
-    [JsonPropertyName("cid")]
-    public string ConversationId { get; set; } = string.Empty;
+    /// <summary>A committed version of the conversation's metadata.</summary>
+    public const string Commit = "commit";
 
-    /// <summary>Optimistic-concurrency version, bumped once per accepted save.</summary>
-    [JsonProperty("version")]
-    [JsonPropertyName("version")]
-    public int Version { get; set; }
-
-    /// <summary>
-    /// How many messages have ever been committed. Ordinals below this are readable; anything
-    /// above is an orphan from a save that failed after appending but before committing.
-    /// </summary>
-    [JsonProperty("messageCount")]
-    [JsonPropertyName("messageCount")]
-    public int MessageCount { get; set; }
-
-    /// <summary>Messages evicted to cold storage; reads start from this ordinal.</summary>
-    [JsonProperty("archived")]
-    [JsonPropertyName("archived")]
-    public int ArchivedCount { get; set; }
-
-    /// <summary>Bumped per compaction; drives the conversation's routing id.</summary>
-    [JsonProperty("epoch")]
-    [JsonPropertyName("epoch")]
-    public int ContextEpoch { get; set; }
-
-    /// <summary>Rolling summary of compacted turns.</summary>
-    [JsonProperty("summary")]
-    [JsonPropertyName("summary")]
-    public string? Summary { get; set; }
-
-    /// <summary>Provider-reported prompt size for the previous turn.</summary>
-    [JsonProperty("lastInputTokens")]
-    [JsonPropertyName("lastInputTokens")]
-    public long? LastInputTokenCount { get; set; }
-
-    [JsonProperty("ttl", NullValueHandling = NullValueHandling.Ignore)]
-    [JsonPropertyName("ttl")]
-    [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public int? TimeToLiveSeconds { get; set; }
+    /// <summary>A rolling summary as of one context epoch.</summary>
+    public const string Summary = "summary";
 }
 
 /// <summary>
-/// One message of a conversation, written once and never modified. The id encodes the
-/// message's global ordinal, so it sorts chronologically and — being deterministic — makes
-/// an append idempotent: replaying a save conflicts (409) instead of duplicating.
+/// Base of every document in a conversation partition. All three kinds are written once and
+/// never modified — the store issues inserts only.
 /// </summary>
-public sealed class CosmosConversationMessage
+/// <remarks>
+/// Both Newtonsoft and System.Text.Json attributes are present because the Cosmos SDK
+/// serializes with Newtonsoft unless the application installs a custom <c>CosmosSerializer</c>.
+/// </remarks>
+public abstract class CosmosConversationDocument
 {
-    /// <summary><c>m-</c> followed by the zero-padded ordinal, unique within the partition.</summary>
+    /// <summary>Unique within the partition, and shaped so ids sort in write order.</summary>
     [JsonProperty("id")]
     [JsonPropertyName("id")]
     public string Id { get; set; } = string.Empty;
@@ -80,7 +36,51 @@ public sealed class CosmosConversationMessage
     [JsonPropertyName("cid")]
     public string ConversationId { get; set; } = string.Empty;
 
-    /// <summary>Position of this message in the conversation, from zero.</summary>
+    /// <summary>One of <see cref="CosmosConversationDocumentTypes"/>.</summary>
+    [JsonProperty("type")]
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = string.Empty;
+
+    [JsonProperty("ttl", NullValueHandling = NullValueHandling.Ignore)]
+    [JsonPropertyName("ttl")]
+    [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? TimeToLiveSeconds { get; set; }
+}
+
+/// <summary>
+/// One committed turn: the conversation's metadata as of <see cref="Version"/>. Inserting it
+/// <em>is</em> the commit — the id is <c>v-{version}</c>, so a second writer attempting the
+/// same version gets a 409 instead of overwriting. That replaces ETag concurrency entirely.
+/// </summary>
+public sealed class CosmosConversationCommit : CosmosConversationDocument
+{
+    [JsonProperty("version")]
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    /// <summary>Messages committed as of this version; reads never look past it.</summary>
+    [JsonProperty("messageCount")]
+    [JsonPropertyName("messageCount")]
+    public int MessageCount { get; set; }
+
+    /// <summary>Messages compacted away; reads start here.</summary>
+    [JsonProperty("archived")]
+    [JsonPropertyName("archived")]
+    public int ArchivedCount { get; set; }
+
+    /// <summary>Context epoch, which also identifies the summary document to read.</summary>
+    [JsonProperty("epoch")]
+    [JsonPropertyName("epoch")]
+    public int ContextEpoch { get; set; }
+
+    [JsonProperty("lastInputTokens")]
+    [JsonPropertyName("lastInputTokens")]
+    public long? LastInputTokenCount { get; set; }
+}
+
+/// <summary>One message, written once. The id encodes its ordinal, making appends idempotent.</summary>
+public sealed class CosmosConversationMessage : CosmosConversationDocument
+{
     [JsonProperty("ordinal")]
     [JsonPropertyName("ordinal")]
     public int Ordinal { get; set; }
@@ -89,9 +89,19 @@ public sealed class CosmosConversationMessage
     [JsonProperty("message")]
     [JsonPropertyName("message")]
     public string Message { get; set; } = string.Empty;
+}
 
-    [JsonProperty("ttl", NullValueHandling = NullValueHandling.Ignore)]
-    [JsonPropertyName("ttl")]
-    [System.Text.Json.Serialization.JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public int? TimeToLiveSeconds { get; set; }
+/// <summary>
+/// The rolling summary as of one context epoch, written only when compaction produces a new
+/// one — so an unchanged summary is never rewritten on an ordinary turn.
+/// </summary>
+public sealed class CosmosConversationSummary : CosmosConversationDocument
+{
+    [JsonProperty("epoch")]
+    [JsonPropertyName("epoch")]
+    public int ContextEpoch { get; set; }
+
+    [JsonProperty("summary")]
+    [JsonPropertyName("summary")]
+    public string? Summary { get; set; }
 }
