@@ -10,7 +10,7 @@ namespace Trellis.Conversations.Storage;
 /// In-process store. Useful for tests and single-instance apps; it still enforces version
 /// checks, so code written against it behaves the same on a distributed backend.
 /// </summary>
-public sealed class InMemoryConversationStore : IConversationStore
+public sealed class InMemoryConversationStore : IReplicatedConversationStore
 {
     private readonly Dictionary<string, string> _conversations = [];
     private readonly Lock _lock = new();
@@ -45,6 +45,27 @@ public sealed class InMemoryConversationStore : IConversationStore
             int next = conversation.Version + 1;
             _conversations[conversation.Id] = ConversationSerializer.Serialize(conversation, next);
             conversation.MarkPersisted(next);
+        }
+        return ValueTask.CompletedTask;
+    }
+
+    public ValueTask<int?> GetVersionAsync(string conversationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(conversationId);
+        lock (_lock)
+        {
+            return ValueTask.FromResult(_conversations.TryGetValue(conversationId, out string? json)
+                ? ConversationSerializer.Deserialize(json)?.Version
+                : null);
+        }
+    }
+
+    public ValueTask ReplaceAsync(ConversationSnapshot snapshot, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        lock (_lock)
+        {
+            _conversations[snapshot.Id] = ConversationSerializer.SerializeSnapshot(snapshot);
         }
         return ValueTask.CompletedTask;
     }

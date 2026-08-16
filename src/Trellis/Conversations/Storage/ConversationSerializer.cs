@@ -21,6 +21,10 @@ internal static class ConversationSerializer
                 conversation.LastInputTokenCount),
             AIJsonUtilities.DefaultOptions);
 
+    /// <summary>Serializes an already-built snapshot, for replication.</summary>
+    public static string SerializeSnapshot(ConversationSnapshot snapshot) =>
+        JsonSerializer.Serialize(snapshot, AIJsonUtilities.DefaultOptions);
+
     public static ConversationSnapshot? Deserialize(string json) =>
         JsonSerializer.Deserialize<ConversationSnapshot>(json, AIJsonUtilities.DefaultOptions);
 

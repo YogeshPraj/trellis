@@ -1,5 +1,4 @@
 using Trellis.Conversations;
-using Trellis.State;
 
 namespace Trellis.Conversations.Storage;
 
@@ -53,7 +52,12 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     }
 
     /// <summary>A conversation awaiting background replication; newer versions replace older.</summary>
-    private sealed record PendingWrite(string Key, string ConversationId, int Version, string Json);
+    private sealed record PendingWrite(ConversationSnapshot Snapshot)
+    {
+        public string ConversationId => Snapshot.Id;
+
+        public int Version => Snapshot.Version;
+    }
 
     private readonly IReadOnlyList<ConversationTier> _tiers;
     private readonly TierState[] _state;
@@ -128,7 +132,6 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     public async ValueTask<Conversation?> LoadAsync(string conversationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(conversationId);
-        string key = _options.KeyPrefix + conversationId;
 
         for (int i = 0; i < _tiers.Count; i++)
         {
@@ -137,10 +140,10 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
                 continue;
             }
 
-            string? json;
+            Conversation? conversation;
             try
             {
-                json = await _tiers[i].Store.GetAsync(key, cancellationToken).ConfigureAwait(false);
+                conversation = await _tiers[i].Store.LoadAsync(conversationId, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -148,24 +151,18 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
                 continue;
             }
 
-            if (json is null)
+            if (conversation is null)
             {
                 continue;   // miss: try the next tier down
             }
 
             MarkHealthy(i);
-            ConversationSnapshot? snapshot = ConversationSerializer.Deserialize(json);
-            if (snapshot is null)
-            {
-                continue;
-            }
-
             if (_options.BackfillOnRead && i > 0)
             {
-                await BackfillAsync(key, conversationId, snapshot.Version, json, upToTier: i, cancellationToken)
+                await BackfillAsync(conversation.ToSnapshot(conversation.Version), upToTier: i, cancellationToken)
                     .ConfigureAwait(false);
             }
-            return ConversationSerializer.ToConversation(snapshot);
+            return conversation;
         }
         return null;
     }
@@ -176,16 +173,30 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
         // Without this, a write-behind save after disposal would queue into a map nothing
         // will ever drain — the caller would be told it saved, and it never would.
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
-        string key = _options.KeyPrefix + conversation.Id;
 
         int authority = ResolveAuthority();
-        (int next, string json) = await WriteAuthorityAsync(authority, key, conversation, cancellationToken)
-            .ConfigureAwait(false);
-        conversation.MarkPersisted(next);
+        try
+        {
+            // The tier runs its own version check and advances the conversation on success.
+            await _tiers[authority].Store.SaveAsync(conversation, cancellationToken).ConfigureAwait(false);
+            MarkHealthy(authority);
+            MarkRepaired(authority, conversation.Id);
+        }
+        catch (ConversationConcurrencyException)
+        {
+            throw;   // a real conflict, not a tier failure
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            MarkUnhealthy(authority, ex);
+            throw;
+        }
+
+        ConversationSnapshot snapshot = conversation.ToSnapshot(conversation.Version);
 
         if (_options.ReplicationMode == ReplicationMode.WriteBehind)
         {
-            QueueReplication(new PendingWrite(key, conversation.Id, next, json));
+            QueueReplication(new PendingWrite(snapshot));
 
             // Past the ceiling, flush inline: backpressure on this caller is honest, and
             // beats a queue that grows until the process dies.
@@ -199,8 +210,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
         // The authority has accepted; every other tier is now a replica to bring in line.
         // They are independent backends, so writing them concurrently costs the slowest
         // replica rather than the sum of all of them.
-        await ReplicateToOthersAsync(authority, key, conversation.Id, next, json, cancellationToken)
-            .ConfigureAwait(false);
+        await ReplicateToOthersAsync(authority, snapshot, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -209,7 +219,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     /// because the write failed — so a background flush knows to try again.
     /// </summary>
     private async ValueTask<bool> ReplicateToOthersAsync(
-        int skipTier, string key, string conversationId, int version, string json, CancellationToken cancellationToken)
+        int skipTier, ConversationSnapshot snapshot, CancellationToken cancellationToken)
     {
         List<Task<bool>>? replicas = null;
         bool allApplied = true;
@@ -224,7 +234,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
                 allApplied = false;     // skipped, so this tier is still behind
                 continue;
             }
-            (replicas ??= []).Add(ReplicateAsync(i, key, conversationId, version, json, cancellationToken).AsTask());
+            (replicas ??= []).Add(ReplicateAsync(i, snapshot, cancellationToken).AsTask());
         }
         if (replicas is not null)
         {
@@ -275,8 +285,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
         try
         {
             // Tier 0 already has it — it was written synchronously.
-            applied = await ReplicateToOthersAsync(
-                skipTier: 0, write.Key, write.ConversationId, write.Version, write.Json, cancellationToken)
+            applied = await ReplicateToOthersAsync(skipTier: 0, write.Snapshot, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -340,7 +349,6 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     public async ValueTask DeleteAsync(string conversationId, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(conversationId);
-        string key = _options.KeyPrefix + conversationId;
         List<Exception>? failures = null;
 
         // Drop any queued replication first: a pending write flushed after the tiers were
@@ -351,7 +359,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
         {
             try
             {
-                await _tiers[i].Store.RemoveAsync(key, cancellationToken).ConfigureAwait(false);
+                await _tiers[i].Store.DeleteAsync(conversationId, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -374,57 +382,6 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     }
 
     /// <summary>
-    /// Writes through the authoritative tier, which performs the version check and
-    /// compare-and-swap. Returns the version it accepted together with the serialized
-    /// snapshot, so replicas reuse it instead of re-serializing the whole conversation.
-    /// </summary>
-    private async ValueTask<(int Version, string Json)> WriteAuthorityAsync(
-        int authority, string key, Conversation conversation, CancellationToken cancellationToken)
-    {
-        ISharedStateStore store = _tiers[authority].Store;
-        try
-        {
-            string? current = await store.GetAsync(key, cancellationToken).ConfigureAwait(false);
-            int stored = current is null ? 0 : ConversationSerializer.Deserialize(current)?.Version ?? 0;
-            if (stored != conversation.Version)
-            {
-                throw new ConversationConcurrencyException(conversation.Id, conversation.Version, stored);
-            }
-
-            int next = conversation.Version + 1;
-            string json = ConversationSerializer.Serialize(conversation, next);
-
-            if (store is IAtomicSharedStateStore atomic)
-            {
-                bool swapped = await atomic
-                    .TrySetIfUnchangedAsync(key, current, json, _tiers[authority].TimeToLive, cancellationToken)
-                    .ConfigureAwait(false);
-                if (!swapped)
-                {
-                    throw new ConversationConcurrencyException(conversation.Id, conversation.Version, stored);
-                }
-            }
-            else
-            {
-                await store.SetAsync(key, json, _tiers[authority].TimeToLive, cancellationToken).ConfigureAwait(false);
-            }
-
-            MarkHealthy(authority);
-            MarkRepaired(authority, conversation.Id);
-            return (next, json);
-        }
-        catch (ConversationConcurrencyException)
-        {
-            throw;   // a real conflict, not a tier failure
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            MarkUnhealthy(authority, ex);
-            throw;
-        }
-    }
-
-    /// <summary>
     /// Copies the accepted snapshot to a replica tier. Failure never fails the turn, but the
     /// tier's entry is removed so it can never serve a version older than the authority's.
     /// </summary>
@@ -434,23 +391,22 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     /// newer one, leaving the replica stale while looking healthy.
     /// </remarks>
     private async ValueTask<bool> ReplicateAsync(
-        int tier, string key, string conversationId, int version, string json, CancellationToken cancellationToken)
+        int tier, ConversationSnapshot snapshot, CancellationToken cancellationToken)
     {
+        IReplicatedConversationStore store = _tiers[tier].Store;
         try
         {
-            string? current = await _tiers[tier].Store.GetAsync(key, cancellationToken).ConfigureAwait(false);
-            if (current is not null && ConversationSerializer.Deserialize(current)?.Version >= version)
+            int? current = await store.GetVersionAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
+            if (current >= snapshot.Version)
             {
                 MarkHealthy(tier);
-                MarkRepaired(tier, conversationId);
+                MarkRepaired(tier, snapshot.Id);
                 return true;   // a newer snapshot already landed here
             }
 
-            await _tiers[tier].Store
-                .SetAsync(key, json, _tiers[tier].TimeToLive, cancellationToken)
-                .ConfigureAwait(false);
+            await store.ReplaceAsync(snapshot, cancellationToken).ConfigureAwait(false);
             MarkHealthy(tier);
-            MarkRepaired(tier, conversationId);
+            MarkRepaired(tier, snapshot.Id);
             return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -458,7 +414,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
             MarkUnhealthy(tier, ex);
             try
             {
-                await _tiers[tier].Store.RemoveAsync(key, cancellationToken).ConfigureAwait(false);
+                await store.DeleteAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception cleanup) when (cleanup is not OperationCanceledException)
             {
@@ -470,7 +426,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     }
 
     private async ValueTask BackfillAsync(
-        string key, string conversationId, int version, string json, int upToTier, CancellationToken cancellationToken)
+        ConversationSnapshot snapshot, int upToTier, CancellationToken cancellationToken)
     {
         List<Task>? writes = null;
         for (int i = 0; i < upToTier; i++)
@@ -479,7 +435,7 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
             {
                 continue;
             }
-            (writes ??= []).Add(ReplicateAsync(i, key, conversationId, version, json, cancellationToken).AsTask());
+            (writes ??= []).Add(ReplicateAsync(i, snapshot, cancellationToken).AsTask());
         }
         if (writes is not null)
         {

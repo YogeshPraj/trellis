@@ -65,6 +65,10 @@ public class TieredConversationStoreTests
             _inner.GetListAsync(key, cancellationToken);
     }
 
+    /// <summary>Wraps a fault-injecting KV fake as the conversation store a tier now requires.</summary>
+    private static ConversationTier Tier(string name, ISharedStateStore store, TimeSpan? timeToLive = null) =>
+        new(name, new SharedStateConversationStore(store, timeToLive), timeToLive);
+
     private static Conversation NewConversation(string id, string text)
     {
         var conversation = new Conversation(id);
@@ -78,8 +82,8 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("redis", fast),
-            new ConversationTier("cosmos", durable));
+            Tier("redis", fast),
+            Tier("cosmos", durable));
 
         await store.SaveAsync(NewConversation("c1", "hello"));
 
@@ -96,10 +100,10 @@ public class TieredConversationStoreTests
         var t3 = new FaultyStore();
         var t4 = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("memory", t1),
-            new ConversationTier("redis", t2),
-            new ConversationTier("cosmos", t3),
-            new ConversationTier("blob", t4));
+            Tier("memory", t1),
+            Tier("redis", t2),
+            Tier("cosmos", t3),
+            Tier("blob", t4));
 
         await store.SaveAsync(NewConversation("c1", "hello"));
 
@@ -147,10 +151,10 @@ public class TieredConversationStoreTests
     {
         var delay = TimeSpan.FromMilliseconds(200);
         var store = new TieredConversationStore(
-            new ConversationTier("r1", new SlowStore(delay)),
-            new ConversationTier("r2", new SlowStore(delay)),
-            new ConversationTier("r3", new SlowStore(delay)),
-            new ConversationTier("authority", new FaultyStore()));
+            Tier("r1", new SlowStore(delay)),
+            Tier("r2", new SlowStore(delay)),
+            Tier("r3", new SlowStore(delay)),
+            Tier("authority", new FaultyStore()));
 
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         await store.SaveAsync(NewConversation("c1", "hello"));
@@ -166,8 +170,8 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("redis", fast),
-            new ConversationTier("cosmos", durable));
+            Tier("redis", fast),
+            Tier("cosmos", durable));
         await store.SaveAsync(NewConversation("c1", "hello"));
 
         durable.FailReads = true;   // never consulted when the fast tier hits
@@ -183,8 +187,8 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("redis", fast),
-            new ConversationTier("cosmos", durable));
+            Tier("redis", fast),
+            Tier("cosmos", durable));
         await store.SaveAsync(NewConversation("c1", "hello"));
 
         await fast.RemoveAsync("conversation:c1");   // e.g. TTL eviction
@@ -200,8 +204,8 @@ public class TieredConversationStoreTests
     public async Task AuthorityOwnsTheVersionCheck()
     {
         var store = new TieredConversationStore(
-            new ConversationTier("redis", new FaultyStore()),
-            new ConversationTier("cosmos", new FaultyStore()));
+            Tier("redis", new FaultyStore()),
+            Tier("cosmos", new FaultyStore()));
         await store.SaveAsync(NewConversation("c1", "first"));
 
         Conversation a = (await store.LoadAsync("c1"))!;
@@ -224,7 +228,7 @@ public class TieredConversationStoreTests
         var durable = new FaultyStore();
         List<string> unhealthy = [];
         var store = new TieredConversationStore(
-            [new ConversationTier("redis", fast), new ConversationTier("cosmos", durable)],
+            [Tier("redis", fast), Tier("cosmos", durable)],
             new TieredConversationStoreOptions { OnTierUnhealthy = (name, _) => unhealthy.Add(name) });
 
         await store.SaveAsync(NewConversation("c1", "first"));
@@ -248,7 +252,7 @@ public class TieredConversationStoreTests
         var durable = new FaultyStore();
         List<string> recovered = [];
         var store = new TieredConversationStore(
-            [new ConversationTier("redis", fast), new ConversationTier("cosmos", durable)],
+            [Tier("redis", fast), Tier("cosmos", durable)],
             new TieredConversationStoreOptions
             {
                 UnhealthyCooldown = TimeSpan.FromSeconds(30),
@@ -289,7 +293,7 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            [new ConversationTier("redis", fast), new ConversationTier("cosmos", durable)],
+            [Tier("redis", fast), Tier("cosmos", durable)],
             new TieredConversationStoreOptions { UnhealthyCooldown = TimeSpan.FromSeconds(30) },
             time);
 
@@ -326,8 +330,8 @@ public class TieredConversationStoreTests
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
             [
-                new ConversationTier("redis", fast, TimeToLive: TimeSpan.FromMinutes(10)),
-                new ConversationTier("cosmos", durable),
+                Tier("redis", fast, TimeSpan.FromMinutes(10)),
+                Tier("cosmos", durable),
             ],
             new TieredConversationStoreOptions { UnhealthyCooldown = TimeSpan.FromSeconds(30) },
             time);
@@ -366,8 +370,8 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("redis", fast),
-            new ConversationTier("cosmos", durable));
+            Tier("redis", fast),
+            Tier("cosmos", durable));
 
         durable.FailWrites = true;
 
@@ -384,7 +388,7 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            [new ConversationTier("redis", fast), new ConversationTier("cosmos", durable)],
+            [Tier("redis", fast), Tier("cosmos", durable)],
             new TieredConversationStoreOptions
             {
                 OnAuthorityUnavailable = AuthorityUnavailableBehavior.PromoteHealthiest,
@@ -416,8 +420,8 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("redis", fast),
-            new ConversationTier("cosmos", durable));
+            Tier("redis", fast),
+            Tier("cosmos", durable));
         await store.SaveAsync(NewConversation("c1", "hi"));
 
         await store.DeleteAsync("c1");
@@ -433,8 +437,8 @@ public class TieredConversationStoreTests
         var fast = new FaultyStore();
         var durable = new FaultyStore();
         var store = new TieredConversationStore(
-            new ConversationTier("redis", fast),
-            new ConversationTier("cosmos", durable));
+            Tier("redis", fast),
+            Tier("cosmos", durable));
         await store.SaveAsync(NewConversation("c1", "hi"));
 
         fast.FailRemoves = true;
@@ -446,8 +450,8 @@ public class TieredConversationStoreTests
     public async Task WorksAsAPlainIConversationStore_ForAnAgentTurn()
     {
         IConversationStore store = new TieredConversationStore(
-            new ConversationTier("redis", new FaultyStore()),
-            new ConversationTier("cosmos", new FaultyStore()));
+            Tier("redis", new FaultyStore()),
+            Tier("cosmos", new FaultyStore()));
         var agent = new Agent(new FakeChatClient("orange"), instructions: "Be brief.");
 
         var first = new Conversation("session-1");
@@ -465,7 +469,7 @@ public class TieredConversationStoreTests
 
     private static TieredConversationStore WriteBehind(
         FaultyStore fast, FaultyStore durable, TieredConversationStoreOptions? options = null) =>
-        new([new ConversationTier("redis", fast), new ConversationTier("cosmos", durable)],
+        new([Tier("redis", fast), Tier("cosmos", durable)],
             options ?? new TieredConversationStoreOptions
             {
                 ReplicationMode = ReplicationMode.WriteBehind,
@@ -662,7 +666,7 @@ public class TieredConversationStoreTests
     {
         Assert.Throws<ArgumentException>(() => new TieredConversationStore([]));
         Assert.Throws<ArgumentException>(() => new TieredConversationStore(
-            new ConversationTier("same", new FaultyStore()),
-            new ConversationTier("same", new FaultyStore())));
+            Tier("same", new FaultyStore()),
+            Tier("same", new FaultyStore())));
     }
 }

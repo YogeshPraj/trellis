@@ -1,5 +1,4 @@
 using Trellis.Conversations;
-using Trellis.State;
 
 namespace Trellis.Conversations.Storage;
 
@@ -11,4 +10,4 @@ namespace Trellis.Conversations.Storage;
 /// long a stale entry can survive if this tier ever misses a write without being detected.
 /// The authoritative (last) tier usually wants null — it is the durable copy.
 /// </param>
-public sealed record ConversationTier(string Name, ISharedStateStore Store, TimeSpan? TimeToLive = null);
+public sealed record ConversationTier(string Name, IReplicatedConversationStore Store, TimeSpan? TimeToLive = null);

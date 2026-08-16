@@ -255,6 +255,69 @@ public class CosmosConversationStoreTests
     }
 
     [Fact]
+    public async Task CanServeAsATierOfATieredStore()
+    {
+        // The point of IReplicatedConversationStore: Cosmos composes into the chain.
+        var latest = new CosmosConversationCommit { Version = 0, MessageCount = 0 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var fast = new InMemoryConversationStore();
+
+        var tiered = new TieredConversationStore(
+            new ConversationTier("memory", fast),
+            new ConversationTier("cosmos", new CosmosConversationStore(container)));
+
+        Assert.Equal("cosmos", tiered.AuthorityName);
+
+        await tiered.SaveAsync(ConversationWith("c1", 0, "hello"));
+
+        // The authority (Cosmos) committed, and the fast tier was replicated into.
+        Assert.Single(recorder.Created.OfType<CosmosConversationCommit>());
+        Assert.NotNull(await fast.LoadAsync("c1"));
+    }
+
+    [Fact]
+    public async Task ReplicationIsUnconditional_AndStillAppendOnly()
+    {
+        var latest = new CosmosConversationCommit { Version = 1, MessageCount = 1 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var store = new CosmosConversationStore(container);
+
+        // A replica write carries a version the authority already decided — no version check,
+        // and still nothing but inserts.
+        await store.ReplaceAsync(new ConversationSnapshot(
+            "c1", 5, [new ChatMessage(ChatRole.User, "one"), new ChatMessage(ChatRole.User, "two")],
+            null, ContextEpoch: 0, ArchivedCount: 0, LastInputTokenCount: null));
+
+        Assert.Equal(0, recorder.ReplaceCalls);
+        Assert.Equal(0, recorder.PatchCalls);
+        CosmosConversationCommit commit = Assert.Single(recorder.Created.OfType<CosmosConversationCommit>());
+        Assert.Equal(5, commit.Version);
+        Assert.Equal("v-000000005", commit.Id);
+    }
+
+    [Fact]
+    public async Task ReplicationSkipsATierAlreadyHoldingSomethingNewer()
+    {
+        var latest = new CosmosConversationCommit { Version = 9, MessageCount = 4 };
+        (Container container, BatchRecorder recorder) = NewContainer(latest);
+        var store = new CosmosConversationStore(container);
+
+        await store.ReplaceAsync(new ConversationSnapshot(
+            "c1", 5, [new ChatMessage(ChatRole.User, "old")], null, 0, 0, null));
+
+        Assert.Empty(recorder.Created);
+    }
+
+    [Fact]
+    public async Task GetVersionAsync_ReadsOnlyTheCommit()
+    {
+        var latest = new CosmosConversationCommit { Version = 12, MessageCount = 40 };
+        (Container container, _) = NewContainer(latest);
+
+        Assert.Equal(12, await new CosmosConversationStore(container).GetVersionAsync("c1"));
+    }
+
+    [Fact]
     public void TtlWithoutContainerSupport_FailsLoudly()
     {
         Container container = Substitute.For<Container>();

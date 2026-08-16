@@ -26,7 +26,7 @@ namespace Trellis.Conversations.Storage;
 /// deleted explicitly, and without expiry they accumulate forever.
 /// </para>
 /// </remarks>
-public sealed class SharedStateConversationStore : IConversationStore
+public sealed class SharedStateConversationStore : IReplicatedConversationStore
 {
     private readonly ISharedStateStore _store;
     private readonly IAtomicSharedStateStore? _atomic;
@@ -110,6 +110,20 @@ public sealed class SharedStateConversationStore : IConversationStore
         }
 
         conversation.MarkPersisted(next);
+    }
+
+    public async ValueTask<int?> GetVersionAsync(string conversationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(conversationId);
+        string? json = await _store.GetAsync(_keyPrefix + conversationId, cancellationToken).ConfigureAwait(false);
+        return json is null ? null : ConversationSerializer.Deserialize(json)?.Version;
+    }
+
+    public ValueTask ReplaceAsync(ConversationSnapshot snapshot, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return _store.SetAsync(
+            _keyPrefix + snapshot.Id, ConversationSerializer.SerializeSnapshot(snapshot), _timeToLive, cancellationToken);
     }
 
     public ValueTask DeleteAsync(string conversationId, CancellationToken cancellationToken = default)

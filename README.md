@@ -381,10 +381,16 @@ If losing conversations when Redis has a bad day isn't acceptable, chain storage
 ```csharp
 IConversationStore store = new TieredConversationStore(
 [
-    new ConversationTier("redis",  redisStore,  TimeToLive: TimeSpan.FromHours(12)),
-    new ConversationTier("cosmos", cosmosStore),          // ← authoritative: owns the version check
+    new ConversationTier("redis",  new SharedStateConversationStore(redis, TimeSpan.FromHours(12))),
+    new ConversationTier("cosmos", new CosmosConversationStore(container)),   // ← authoritative
 ]);
 ```
+
+Tiers are `IReplicatedConversationStore` — a conversation store that can also be replicated
+into. That's a deliberately separate interface from `IConversationStore`: a replica must be
+writable *unconditionally* (the authority already decided the version, so a second version
+check would reject a correct write) and must report its version cheaply, and neither is
+something application code should be able to do.
 
 Adding another tier is adding another line — the list *is* the configuration, and any `ISharedStateStore` qualifies (Redis, the `IDistributedCache` bridge, in-memory, your own):
 

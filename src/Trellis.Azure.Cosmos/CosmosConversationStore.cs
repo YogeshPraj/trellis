@@ -46,7 +46,7 @@ namespace Trellis.Azure.Cosmos;
 /// <para><b>Container requirements:</b> partition key path <c>/cid</c>, and
 /// <c>DefaultTimeToLive</c> configured if a <c>timeToLive</c> is supplied.</para>
 /// </remarks>
-public sealed class CosmosConversationStore : IConversationStore
+public sealed class CosmosConversationStore : IReplicatedConversationStore
 {
     /// <summary>A transactional batch is capped at 100 operations; the commit takes one.</summary>
     private const int MaxAppendsPerBatch = 99;
@@ -173,6 +173,94 @@ public sealed class CosmosConversationStore : IConversationStore
             .ConfigureAwait(false);
 
         conversation.MarkPersisted(nextVersion);
+    }
+
+    /// <summary>Cheap: only the newest commit document is read, never the messages.</summary>
+    public async ValueTask<int?> GetVersionAsync(string conversationId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(conversationId);
+        CosmosConversationCommit? commit = await ReadLatestCommitAsync(conversationId, cancellationToken)
+            .ConfigureAwait(false);
+        return commit?.Version;
+    }
+
+    /// <summary>
+    /// Brings this store up to <paramref name="snapshot"/> without a version check, for
+    /// replication. Still append-only: missing messages are inserted and the snapshot's own
+    /// commit document is created. A commit that already exists means another replica write
+    /// got there first, which is success, not a conflict.
+    /// </summary>
+    public async ValueTask ReplaceAsync(ConversationSnapshot snapshot, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        string conversationId = snapshot.Id;
+
+        CosmosConversationCommit? latest = await ReadLatestCommitAsync(conversationId, cancellationToken)
+            .ConfigureAwait(false);
+        if (latest is not null && latest.Version >= snapshot.Version)
+        {
+            return;   // already at or beyond this snapshot
+        }
+
+        int committed = latest?.MessageCount ?? 0;
+        int total = snapshot.ArchivedCount + snapshot.Messages.Count;
+        int firstAppendable = Math.Max(committed, snapshot.ArchivedCount);
+
+        List<CosmosConversationDocument> appends = [];
+        for (int ordinal = firstAppendable; ordinal < total; ordinal++)
+        {
+            appends.Add(new CosmosConversationMessage
+            {
+                Id = MessageId(ordinal),
+                ConversationId = conversationId,
+                Type = CosmosConversationDocumentTypes.Message,
+                Ordinal = ordinal,
+                Message = JsonSerializer.Serialize(
+                    snapshot.Messages[ordinal - snapshot.ArchivedCount], AIJsonUtilities.DefaultOptions),
+                TimeToLiveSeconds = TimeToLiveSeconds(),
+            });
+        }
+
+        if (snapshot.Summary is string summary && snapshot.ContextEpoch > (latest?.ContextEpoch ?? 0))
+        {
+            appends.Add(new CosmosConversationSummary
+            {
+                Id = SummaryId(snapshot.ContextEpoch),
+                ConversationId = conversationId,
+                Type = CosmosConversationDocumentTypes.Summary,
+                ContextEpoch = snapshot.ContextEpoch,
+                Summary = summary,
+                TimeToLiveSeconds = TimeToLiveSeconds(),
+            });
+        }
+
+        var commit = new CosmosConversationCommit
+        {
+            Id = CommitId(snapshot.Version),
+            ConversationId = conversationId,
+            Type = CosmosConversationDocumentTypes.Commit,
+            Version = snapshot.Version,
+            MessageCount = total,
+            ArchivedCount = snapshot.ArchivedCount,
+            ContextEpoch = snapshot.ContextEpoch,
+            LastInputTokenCount = snapshot.LastInputTokenCount,
+            TimeToLiveSeconds = TimeToLiveSeconds(),
+        };
+
+        TransactionalBatch batch = _container.CreateTransactionalBatch(new PartitionKey(conversationId));
+        foreach (CosmosConversationDocument document in appends)
+        {
+            batch.CreateItem(document);
+        }
+        batch.CreateItem(commit);
+
+        using TransactionalBatchResponse response = await batch.ExecuteAsync(cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.Conflict)
+        {
+            throw new CosmosException(
+                $"Replicating conversation '{conversationId}' failed: {response.ErrorMessage}",
+                response.StatusCode, 0, response.ActivityId, response.RequestCharge);
+        }
     }
 
     public async ValueTask DeleteAsync(string conversationId, CancellationToken cancellationToken = default)
