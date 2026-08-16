@@ -627,6 +627,35 @@ public class TieredConversationStoreTests
     }
 
     [Fact]
+    public async Task WriteBehind_DeleteIsNotUndoneByAPendingReplication()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        await using TieredConversationStore store = WriteBehind(fast, durable);
+
+        await store.SaveAsync(NewConversation("c1", "hello"));   // queued, not yet replicated
+        await store.DeleteAsync("c1");
+        await store.FlushAsync();
+
+        // The flusher must not resurrect what the caller deleted.
+        Assert.Null(await durable.PeekAsync("conversation:c1"));
+        Assert.Null(await store.LoadAsync("c1"));
+    }
+
+    [Fact]
+    public async Task WriteBehind_SaveAfterDisposalIsRefused_NotSilentlyDropped()
+    {
+        var fast = new FaultyStore();
+        var durable = new FaultyStore();
+        var store = WriteBehind(fast, durable);
+        await store.DisposeAsync();
+
+        // Queuing into a map nothing will drain would tell the caller it saved when it did not.
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => store.SaveAsync(NewConversation("c1", "hello")).AsTask());
+    }
+
+    [Fact]
     public void RejectsEmptyOrDuplicateTiers()
     {
         Assert.Throws<ArgumentException>(() => new TieredConversationStore([]));

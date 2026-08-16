@@ -173,6 +173,9 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
     public async ValueTask SaveAsync(Conversation conversation, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(conversation);
+        // Without this, a write-behind save after disposal would queue into a map nothing
+        // will ever drain — the caller would be told it saved, and it never would.
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
         string key = _options.KeyPrefix + conversation.Id;
 
         int authority = ResolveAuthority();
@@ -340,6 +343,10 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
         string key = _options.KeyPrefix + conversationId;
         List<Exception>? failures = null;
 
+        // Drop any queued replication first: a pending write flushed after the tiers were
+        // cleared would put the conversation back, resurrecting what the caller deleted.
+        _pending.TryRemove(conversationId, out _);
+
         for (int i = 0; i < _tiers.Count; i++)
         {
             try
@@ -352,6 +359,10 @@ public sealed class TieredConversationStore : IConversationStore, IAsyncDisposab
                 (failures ??= []).Add(ex);
             }
         }
+
+        // A save racing this delete could have re-queued between the two; clear it again so
+        // the flusher cannot revive the conversation after we reported it gone.
+        _pending.TryRemove(conversationId, out _);
 
         // A delete that only partly succeeded would leave the conversation retrievable from a
         // tier that outlives the others — say so rather than reporting success.
