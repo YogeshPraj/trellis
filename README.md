@@ -285,6 +285,30 @@ The failure policy distinguishes *provider* problems from *request* problems, Li
 
 When a provider says how long to back off (`Retry-After`), that exact duration is used instead of the exponential cooldown.
 
+### Model aliasing
+
+Routing across endpoints answers *which deployment*. Aliasing answers *which model* — they're
+different questions, and OpenRouter-style gateways need both:
+
+```csharp
+new ModelEndpoint("azure-eastus", azure) { Models = ["gpt-4o", "gpt-4o-mini"] },
+new ModelEndpoint("anthropic",    claude) { Models = ["claude-haiku-4"] },
+
+// options: ModelAliases = new ModelAliasTable()
+//     .Add("fast",  "gpt-4o-mini", "claude-haiku-4")   // second is the fallback model
+//     .Add("gpt-4o", "gpt-4o", "gpt-4o-2024-08-06")    // pin a snapshot as backup
+```
+
+A request for `fast` is rewritten to `gpt-4o-mini` on the way out, and only if **every healthy
+endpoint serving it has been exhausted** does the router try `claude-haiku-4`. The alias order
+is the outer loop, so a fallback model is genuinely a last resort rather than something the
+load balancer might pick first.
+
+- Endpoints that declare no `Models` serve anything, so this is additive — existing setups keep working.
+- Aliasing composes with priority, capability filtering and the selection strategies; it doesn't bypass them.
+- The caller's `ChatOptions` is never mutated — the model is rewritten on a clone, since the options object is usually reused.
+- `router.GetCatalogue()` lists every concrete model, which endpoints serve it, and every alias with what it resolves to — what a `/v1/models` endpoint or an admin UI needs.
+
 ### Load balancing within a tier
 
 Priorities always win first; a selection strategy only arbitrates *within* one tier:

@@ -30,6 +30,12 @@ public sealed class ModelRouterOptions
     /// </summary>
     public IEndpointHealthStore HealthStore { get; set; } = new InMemoryEndpointHealthStore();
 
+    /// <summary>
+    /// Turns the model a caller asked for into the concrete models that may serve it. Null
+    /// (the default) passes every request through unchanged.
+    /// </summary>
+    public IModelAliasResolver? ModelAliases { get; set; }
+
     /// <summary>How endpoints within one priority tier are ordered per request.</summary>
     public IEndpointSelectionStrategy SelectionStrategy { get; set; } = new RoundRobinSelectionStrategy();
 

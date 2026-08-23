@@ -44,6 +44,21 @@ public sealed class ModelEndpoint
     public double? CostPerMillionTokens { get; init; }
 
     /// <summary>
+    /// Models this deployment serves. Empty (the default) means it serves whatever it is
+    /// asked for, which is how the router behaved before model aliasing existed — so adding
+    /// this to some endpoints never silently excludes the others.
+    /// </summary>
+    public IReadOnlyList<string> Models { get; init; } = [];
+
+    /// <summary>
+    /// Whether this deployment can serve <paramref name="model"/>. A request that names no
+    /// model is served by anything, since the deployment's own default applies.
+    /// </summary>
+    public bool Serves(string? model) =>
+        Models.Count == 0 || model is null
+        || Models.Contains(model, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Relative share of traffic within its priority tier, used by
     /// <see cref="WeightedSelectionStrategy"/> (default 1 — an equal share). A deployment
     /// with weight 3 receives three times the requests of one with weight 1.

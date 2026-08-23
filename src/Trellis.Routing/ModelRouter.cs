@@ -28,10 +28,13 @@ namespace Trellis.Routing;
 /// </summary>
 public sealed class ModelRouter : IChatClient
 {
-    private readonly struct Candidate(ModelEndpoint endpoint, EndpointHealth health)
+    private readonly struct Candidate(ModelEndpoint endpoint, EndpointHealth health, string? modelId)
     {
         public ModelEndpoint Endpoint { get; } = endpoint;
         public EndpointHealth Health { get; } = health;
+
+        /// <summary>The concrete model to ask this endpoint for; null passes the caller's through.</summary>
+        public string? ModelId { get; } = modelId;
     }
 
     private readonly struct Requirements
@@ -40,6 +43,7 @@ public sealed class ModelRouter : IChatClient
         public bool NeedsVision { get; init; }
         public bool NeedsJson { get; init; }
         public int EstimatedTokens { get; init; }
+        public string? RequestedModel { get; init; }
 
         public static Requirements From(IList<ChatMessage> messages, ChatOptions? options)
         {
@@ -66,11 +70,13 @@ public sealed class ModelRouter : IChatClient
                 NeedsJson = options?.ResponseFormat is ChatResponseFormatJson,
                 NeedsVision = vision,
                 EstimatedTokens = chars / 4,
+                RequestedModel = options?.ModelId,
             };
         }
 
         public override string ToString() =>
-            $"tools={NeedsTools}, vision={NeedsVision}, json={NeedsJson}, ~{EstimatedTokens} tokens";
+            $"model={RequestedModel ?? "(any)"}, tools={NeedsTools}, vision={NeedsVision}, " +
+            $"json={NeedsJson}, ~{EstimatedTokens} tokens";
     }
 
     private readonly ModelEndpoint[] _endpoints;
@@ -108,6 +114,7 @@ public sealed class ModelRouter : IChatClient
             cancellationToken.ThrowIfCancellationRequested();
             (IList<ChatMessage> send, ChatOptions? sendOptions) =
                 _conversations.Prepare(candidate.Endpoint, full, options, streaming: false);
+            sendOptions = WithModel(sendOptions, candidate.ModelId);
 
             long started = _time.GetTimestamp();
             // The lease makes this endpoint's load visible to LeastLoadedSelectionStrategy
@@ -154,6 +161,7 @@ public sealed class ModelRouter : IChatClient
             cancellationToken.ThrowIfCancellationRequested();
             (IList<ChatMessage> send, ChatOptions? sendOptions) =
                 _conversations.Prepare(candidate.Endpoint, full, options, streaming: true);
+            sendOptions = WithModel(sendOptions, candidate.ModelId);
 
             // Fail over only until the first token arrives; after that the stream is committed.
             IAsyncEnumerator<ChatResponseUpdate>? stream = null;
@@ -219,6 +227,55 @@ public sealed class ModelRouter : IChatClient
         }
 
         throw await AllUnavailableAsync(attempts, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Everything this router can serve: each concrete model with the endpoints behind it,
+    /// plus every alias and what it resolves to. Intended for discovery endpoints and admin
+    /// surfaces that need to answer "what models are available?" without guessing.
+    /// </summary>
+    public IReadOnlyList<ModelCatalogueEntry> GetCatalogue()
+    {
+        var entries = new List<ModelCatalogueEntry>();
+        var concrete = new SortedDictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        bool servesAnything = false;
+
+        foreach (ModelEndpoint endpoint in _endpoints)
+        {
+            if (endpoint.Models.Count == 0)
+            {
+                servesAnything = true;
+                continue;
+            }
+            foreach (string model in endpoint.Models)
+            {
+                if (!concrete.TryGetValue(model, out List<string>? names))
+                {
+                    concrete[model] = names = [];
+                }
+                names.Add(endpoint.Name);
+            }
+        }
+
+        foreach ((string model, List<string> endpoints) in concrete)
+        {
+            entries.Add(new ModelCatalogueEntry(model, IsAlias: false, endpoints, ResolvesTo: []));
+        }
+
+        if (_options.ModelAliases is ModelAliasTable table)
+        {
+            foreach ((string alias, IReadOnlyList<string> targets) in table)
+            {
+                List<string> servedBy = [.. targets
+                    .SelectMany(t => concrete.TryGetValue(t, out List<string>? e) ? e : [])
+                    .Distinct(StringComparer.OrdinalIgnoreCase)];
+                entries.Add(new ModelCatalogueEntry(alias, IsAlias: true, servedBy, targets));
+            }
+        }
+
+        // An endpoint that declares no models serves anything, so the catalogue is a lower
+        // bound rather than an exhaustive list — say so instead of implying completeness.
+        return entries.Count == 0 && servesAnything ? [] : entries;
     }
 
     public object? GetService(Type serviceType, object? serviceKey = null) =>
@@ -305,37 +362,78 @@ public sealed class ModelRouter : IChatClient
     private async ValueTask<List<Candidate>> SelectAsync(Requirements requirements, CancellationToken cancellationToken)
     {
         DateTimeOffset now = _time.GetUtcNow();
-        List<Candidate> available = [];
-        List<Candidate> coolingDown = [];
-        foreach (ModelEndpoint endpoint in _endpoints)
-        {
-            if (!IsCompatible(endpoint.Capabilities, requirements))
-            {
-                continue;
-            }
-            EndpointHealth health = await _options.HealthStore.GetAsync(endpoint.Name, cancellationToken).ConfigureAwait(false);
-            (health.UnavailableUntil <= now ? available : coolingDown).Add(new Candidate(endpoint, health));
-        }
-
         var context = new SelectionContext(Interlocked.Increment(ref _rotation), _metrics, _inFlight);
         List<Candidate> order = [];
-        foreach (IGrouping<int, Candidate> tierGroup in available.GroupBy(c => c.Endpoint.Priority).OrderBy(g => g.Key))
+        List<Candidate> coolingDown = [];
+        HashSet<string> queued = new(StringComparer.Ordinal);
+
+        // The alias order is the outer loop: every healthy endpoint for the preferred model is
+        // exhausted before the next model is considered, so a fallback model is genuinely a
+        // last resort rather than something a load balancer might pick first.
+        foreach (string? model in ResolveModels(requirements.RequestedModel))
         {
-            Dictionary<ModelEndpoint, Candidate> byEndpoint = tierGroup.ToDictionary(c => c.Endpoint);
-            foreach (ModelEndpoint endpoint in _options.SelectionStrategy.OrderTier([.. byEndpoint.Keys], context))
+            List<Candidate> available = [];
+            foreach (ModelEndpoint endpoint in _endpoints)
             {
-                if (byEndpoint.TryGetValue(endpoint, out Candidate candidate))
+                if (!endpoint.Serves(model) || !IsCompatible(endpoint.Capabilities, requirements))
                 {
-                    order.Add(candidate);
+                    continue;
+                }
+                EndpointHealth health = await _options.HealthStore.GetAsync(endpoint.Name, cancellationToken).ConfigureAwait(false);
+                var candidate = new Candidate(endpoint, health, model);
+                (health.UnavailableUntil <= now ? available : coolingDown).Add(candidate);
+            }
+
+            foreach (IGrouping<int, Candidate> tierGroup in available.GroupBy(c => c.Endpoint.Priority).OrderBy(g => g.Key))
+            {
+                Dictionary<ModelEndpoint, Candidate> byEndpoint = tierGroup.ToDictionary(c => c.Endpoint);
+                foreach (ModelEndpoint endpoint in _options.SelectionStrategy.OrderTier([.. byEndpoint.Keys], context))
+                {
+                    if (byEndpoint.TryGetValue(endpoint, out Candidate candidate) && queued.Add(Key(candidate)))
+                    {
+                        order.Add(candidate);
+                    }
                 }
             }
         }
 
-        if (available.Count == 0 && _options.AllTrippedBehavior == AllTrippedBehavior.TryAnyway)
+        if (order.Count == 0 && _options.AllTrippedBehavior == AllTrippedBehavior.TryAnyway)
         {
-            order.AddRange(coolingDown.OrderBy(c => c.Health.UnavailableUntil));
+            order.AddRange(coolingDown.OrderBy(c => c.Health.UnavailableUntil).Where(c => queued.Add(Key(c))));
         }
         return order;
+    }
+
+    /// <summary>An endpoint may appear once per concrete model, never twice for the same pair.</summary>
+    private static string Key(Candidate candidate) => candidate.Endpoint.Name + "\u0000" + candidate.ModelId;
+
+    /// <summary>
+    /// The concrete models that may serve this request, in preference order. Without an alias
+    /// resolver — or for a request that names no model — this is just the request as given.
+    /// </summary>
+    private IReadOnlyList<string?> ResolveModels(string? requestedModel)
+    {
+        if (requestedModel is null || _options.ModelAliases is not IModelAliasResolver resolver)
+        {
+            return [requestedModel];
+        }
+        IReadOnlyList<string> resolved = resolver.Resolve(requestedModel);
+        return resolved.Count == 0 ? [] : [.. resolved.Cast<string?>()];
+    }
+
+    /// <summary>
+    /// Overrides the model on an outgoing request. Clones rather than mutating, because the
+    /// options object belongs to the caller and may be reused across requests.
+    /// </summary>
+    private static ChatOptions? WithModel(ChatOptions? options, string? modelId)
+    {
+        if (modelId is null || string.Equals(options?.ModelId, modelId, StringComparison.Ordinal))
+        {
+            return options;
+        }
+        ChatOptions shaped = options?.Clone() ?? new ChatOptions();
+        shaped.ModelId = modelId;
+        return shaped;
     }
 
     private static bool IsCompatible(ModelCapabilities capabilities, Requirements requirements)
@@ -361,7 +459,13 @@ public sealed class ModelRouter : IChatClient
 
     private void ThrowIfNoneCompatible(Requirements requirements)
     {
-        if (!_endpoints.Any(e => IsCompatible(e.Capabilities, requirements)))
+        IReadOnlyList<string?> models = ResolveModels(requirements.RequestedModel);
+        if (models.Count == 0)
+        {
+            throw new NoCompatibleModelException(
+                $"No model is configured to serve '{requirements.RequestedModel}'.");
+        }
+        if (!_endpoints.Any(e => models.Any(e.Serves) && IsCompatible(e.Capabilities, requirements)))
         {
             throw new NoCompatibleModelException($"No registered endpoint supports this request ({requirements}).");
         }
