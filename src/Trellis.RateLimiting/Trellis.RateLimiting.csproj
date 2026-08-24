@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>Proactive rate limiting for Trellis: per-subject and per-model limits applied before a provider call, so a 429 is avoided rather than reacted to.</Description>
+    <PackageTags>ai;agents;llm;ratelimit;throttling;trellis</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Threading.RateLimiting" Version="10.0.11" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Trellis\Trellis.csproj" />
+  </ItemGroup>
+
+</Project>

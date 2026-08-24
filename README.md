@@ -496,6 +496,30 @@ The token trigger prefers **the provider's own reported input tokens** for the p
 
 What the model sees each turn: your instructions → *"Summary of the earlier conversation: ..."* → the hot tail. Each compaction bumps the conversation's `ContextEpoch`, which changes its routing id — so a conversation-aware router discards provider-side deltas and replays the compacted history in full (a server-side delta against the pre-compaction transcript would be wrong). The archive reuses `ISharedStateStore`, so cold context can live in memory, Redis, or any `IDistributedCache` backend.
 
+## Rate limiting
+
+The router already *reacts* to a provider 429 by tripping the endpoint and failing over.
+`Trellis.RateLimiting` is the other half — refusing locally, so a predictable overage never
+leaves the process:
+
+```csharp
+IChatClient limited = router.AsBuilder()
+    .UseRateLimit(requestsPerWindow: 60, window: TimeSpan.FromMinutes(1),
+                  subjectSelector: _ => CurrentTenant(), perModel: true)
+    .Build();
+```
+
+A refused request throws `RateLimitRejectedException` rather than a provider error, because
+the two mean different things: this one cost nothing, never reached the provider, and must
+*not* trip an endpoint or trigger failover. Streaming holds its lease until the last token,
+since a stream occupies the provider for its whole duration.
+
+Requests are refused rather than queued by default — queueing an LLM call behind a limit
+usually just moves the timeout. Pass your own `PartitionedRateLimiter` if you want a queue.
+
+⚠️ Limits are **per process**. Several instances each enforce their own share, so a
+fleet-wide budget means dividing by instance count, or fronting it with a shared limiter.
+
 ## Metered access with credits
 
 `Trellis.Credits` turns model usage into a spendable balance, with no payment provider and no
@@ -605,6 +629,7 @@ library is visible from the `using` list:
 | `Trellis.State` | Cross-instance shared state: `ISharedStateStore` with in-memory and `IDistributedCache` providers |
 | `Trellis.State.Redis` | Redis provider for `Trellis.State` (StackExchange.Redis) |
 | `Trellis.Azure.Cosmos` | Azure Cosmos DB provider for `Trellis.State`: durable cross-instance storage with ETag-based compare-and-swap |
+| `Trellis.RateLimiting` | Proactive per-caller and per-model limits applied before a provider call |
 | `Trellis.Credits` | Credit accounting: append-only ledger, post-charge and prepaid admission policies, priced from model usage. No money — credits are an abstract unit |
 | `Trellis.Mcp` | MCP client support: connect agents to Model Context Protocol servers (stdio/HTTP) with multi-server aggregation, allow-listing, and failure isolation |
 
