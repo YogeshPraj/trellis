@@ -570,6 +570,23 @@ builder.Services.AddOpenTelemetry()
 
 It deliberately does **not** instrument the chat call itself — `Microsoft.Extensions.AI`'s `UseOpenTelemetry()` already does, and duplicating it would double-count tokens. Compose both for the full picture.
 
+### Durable usage records
+
+Spans and metrics are for watching the system live. `IUsageRecordSink` is the row you keep —
+who spent what, on which model, and how it ended:
+
+```csharp
+IChatClient recorded = router.AsBuilder()
+    .UseUsageRecording(sink, subjectSelector: _ => CurrentTenant())
+    .Build();
+```
+
+The record is written in a `finally`, so **failed and abandoned requests are recorded too**.
+That matters most for streaming: a caller who disconnects halfway has still consumed tokens,
+and a sink that only captured clean completions would under-report exactly the traffic worth
+investigating. A sink failure never fails the request — the response already happened, and
+turning an audit problem into a user-visible error is the wrong trade.
+
 | Signal | What it tells you |
 |---|---|
 | `invoke_agent` span | One agent run: result type, model, token usage, `trellis.agent.attempts` (>1 means self-healing kicked in), error status |
