@@ -496,6 +496,42 @@ The token trigger prefers **the provider's own reported input tokens** for the p
 
 What the model sees each turn: your instructions → *"Summary of the earlier conversation: ..."* → the hot tail. Each compaction bumps the conversation's `ContextEpoch`, which changes its routing id — so a conversation-aware router discards provider-side deltas and replays the compacted history in full (a server-side delta against the pre-compaction transcript would be wrong). The archive reuses `ISharedStateStore`, so cold context can live in memory, Redis, or any `IDistributedCache` backend.
 
+## Metered access with credits
+
+`Trellis.Credits` turns model usage into a spendable balance, with no payment provider and no
+currency anywhere in the system — a credit is an abstract unit, and what one is worth is a
+deployment concern that never enters the code.
+
+```csharp
+var ledger  = new InMemoryCreditLedger();          // or a distributed provider
+var account = new CreditAccount(ledger);
+await account.GrantAsync("team-a", 10_000_000, grantId: "plan-2026-08");
+
+IChatClient metered = router.AsBuilder()
+    .UseCredits(new PostChargeCreditPolicy(ledger, rates), options => CurrentTenant())
+    .Build();
+```
+
+**The ledger is append-only.** A balance is the sum of entries, never a field that gets
+overwritten — so concurrent spends can't lose updates, every movement is auditable, and the
+entry id is the idempotency key: a retried charge is a duplicate the ledger refuses rather
+than a second deduction.
+
+An LLM's cost is unknown until *after* the call, which makes the obvious design — check
+balance, call, deduct — unsafe under concurrency. Both answers ship:
+
+| | How it works | Trade |
+|---|---|---|
+| `PostChargeCreditPolicy` | Admit above a floor, charge the real cost after | One write per request, never rejects a call that would have worked — but a subject can overshoot by roughly *concurrency × cost-of-one-call* and go negative |
+| `PrepaidCreditPolicy` | Hold `maxOutputTokens × rate` up front, settle the difference after | Cannot overspend, even under concurrency — but needs an output cap, and abandoned holds must be swept |
+
+The hold is itself a ledger entry, so it shows in the balance immediately and settlement
+*appends a release* rather than editing it. `ReleaseExpiredAsync` returns credits held by
+requests that died before settling — run it on a timer, or those credits stay stranded.
+
+`UseCredits` settles in a `finally`, so a hold is released even when the call throws or the
+caller abandons a stream mid-flight.
+
 ## Observability & cost
 
 Trellis instruments the layer that provider-level tracing can't see: a whole **agent run** (self-healing retries included) and **graph orchestration** (one span per node execution). It uses only `System.Diagnostics` primitives, so there's no OpenTelemetry SDK dependency — subscribe by name:
@@ -569,6 +605,7 @@ library is visible from the `using` list:
 | `Trellis.State` | Cross-instance shared state: `ISharedStateStore` with in-memory and `IDistributedCache` providers |
 | `Trellis.State.Redis` | Redis provider for `Trellis.State` (StackExchange.Redis) |
 | `Trellis.Azure.Cosmos` | Azure Cosmos DB provider for `Trellis.State`: durable cross-instance storage with ETag-based compare-and-swap |
+| `Trellis.Credits` | Credit accounting: append-only ledger, post-charge and prepaid admission policies, priced from model usage. No money — credits are an abstract unit |
 | `Trellis.Mcp` | MCP client support: connect agents to Model Context Protocol servers (stdio/HTTP) with multi-server aggregation, allow-listing, and failure isolation |
 
 ## Cloud providers, and swapping them

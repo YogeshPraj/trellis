@@ -33,6 +33,7 @@
     <ProjectReference Include="..\..\src\Trellis.State.Redis\Trellis.State.Redis.csproj" />
     <ProjectReference Include="..\..\src\Trellis.Mcp\Trellis.Mcp.csproj" />
     <ProjectReference Include="..\..\src\Trellis.Azure.Cosmos\Trellis.Azure.Cosmos.csproj" />
+    <ProjectReference Include="..\..\src\Trellis.Credits\Trellis.Credits.csproj" />
   </ItemGroup>
 
   <!-- Tests reach across every subsystem; global usings keep the noise out of the test files. -->
@@ -46,6 +47,7 @@
     <Using Include="Trellis.Diagnostics" />
     <Using Include="Trellis.Tokens" />
     <Using Include="Trellis.Tools" />
+    <Using Include="Trellis.Credits" />
     <Using Include="Trellis.Graph.Checkpointing" />
     <Using Include="Trellis.Graph.Diagnostics" />
     <Using Include="Trellis.Graph.Resilience" />

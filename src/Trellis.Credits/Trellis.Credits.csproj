@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>Credit accounting for Trellis: an append-only ledger with post-charge and prepaid admission policies, priced from model usage. No money, no payment providers — credits are an abstract unit.</Description>
+    <PackageTags>ai;agents;llm;quota;credits;trellis</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Trellis\Trellis.csproj" />
+  </ItemGroup>
+
+</Project>
