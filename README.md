@@ -712,6 +712,15 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
 
 - ✅ **Contract behavior validated against a real model** (local Ollama): plain agent runs, **typed structured outputs**, **self-healing validation retries**, **token-by-token streaming** (text and typed), **automatic tool invocation**, multi-turn conversations. These integration tests live in `OllamaIntegrationTests` and run whenever a local Ollama is reachable; they no-op otherwise (e.g. CI).
 - 📜 **`ServerConversationState` is an opt-in contract**: marking an endpoint with it asserts its `IChatClient` follows the documented `ConversationId` semantics (see the flag's XML docs). Trellis's sync logic is verified against that contract; conformance of a given adapter is the adapter's responsibility.
+- 🧪 **Cosmos providers validated against the emulator**: `CosmosEmulatorIntegrationTests` runs the append-only conversation schema and the shared-state store against a real Azure Cosmos DB emulator — transactional-batch atomicity, 409-on-duplicate-id (the concurrency mechanism itself), `ORDER BY c.version DESC` inside a partition, ETag compare-and-swap under contention, and server-side patch increments. They no-op when no emulator is reachable, so CI stays green without one.
+
+  The emulator **requires an elevated shell**:
+
+  ```bash
+  & "C:\Program Files\Azure Cosmos DB Emulator\Microsoft.Azure.Cosmos.Emulator.exe" /NoUI /NoExplorer
+  ```
+
+  then `dotnet test --filter "FullyQualifiedName~CosmosEmulator"`.
 - ⚠️ **Multi-instance notes**: router health state, conversation archives, and the conversation store are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only). Conversations now persist and rehydrate through `IConversationStore` with optimistic concurrency; the graph run-guard remains per-process, so route a given thread id to one instance.
 
 ## Roadmap

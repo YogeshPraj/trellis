@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.11.0**. 320 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.11.0**. 336 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -38,6 +38,11 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
    don't test against live vendor APIs. Real-model wiring validation uses **local Ollama**
    (`OllamaIntegrationTests`, model `qwen2.5:1.5b`; tests no-op when Ollama is down).
    Note: coder-tuned small models emit tool calls as plain text — useless for tool tests.
+   Cosmos providers are validated against the **local Azure Cosmos DB emulator**
+   (`CosmosEmulatorIntegrationTests`, endpoint `https://localhost:8081` + the published
+   well-known key; tests no-op when unreachable). ⚠ The emulator needs an **elevated** shell —
+   `/GetStatus` fails with "requires elevation" otherwise, and a non-elevated launch listens
+   on 8081 without ever serving TLS, which looks like a hang.
    The same rule shapes MCP: Trellis logic sits behind `IMcpToolSource` and is unit-tested
    with fakes; the SDK adapter is validated against the reference server in
    `McpIntegrationTests` (`npx @modelcontextprotocol/server-everything`, no-ops without Node).
