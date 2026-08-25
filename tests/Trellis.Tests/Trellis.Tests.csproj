@@ -12,6 +12,7 @@
   <ItemGroup>
     <PackageReference Include="coverlet.collector" Version="6.0.0" />
     <PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.10.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
     <PackageReference Include="NSubstitute" Version="6.0.0" />
     <PackageReference Include="OllamaSharp" Version="5.4.30" />
@@ -35,6 +36,7 @@
     <ProjectReference Include="..\..\src\Trellis.Azure.Cosmos\Trellis.Azure.Cosmos.csproj" />
     <ProjectReference Include="..\..\src\Trellis.Credits\Trellis.Credits.csproj" />
     <ProjectReference Include="..\..\src\Trellis.RateLimiting\Trellis.RateLimiting.csproj" />
+    <ProjectReference Include="..\..\src\Trellis.Graph.Leasing\Trellis.Graph.Leasing.csproj" />
   </ItemGroup>
 
   <!-- Tests reach across every subsystem; global usings keep the noise out of the test files. -->
@@ -52,6 +54,7 @@
     <Using Include="Trellis.RateLimiting" />
     <Using Include="Trellis.Graph.Checkpointing" />
     <Using Include="Trellis.Graph.Diagnostics" />
+    <Using Include="Trellis.Graph.Leasing" />
     <Using Include="Trellis.Graph.Resilience" />
     <Using Include="Trellis.Routing.Capabilities" />
     <Using Include="Trellis.Routing.Failures" />

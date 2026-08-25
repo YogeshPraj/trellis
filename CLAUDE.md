@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.11.0**. 336 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.12.0**. 375 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -52,7 +52,8 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 | Project | Purpose |
 |---|---|
 | `src/Trellis` | Typed agents: `Agent<TResult>`, `Agent<TDeps,TResult>` (per-run tool DI), self-healing outputs (`IOutputValidator<TResult>` + `OutputRetryOptions`, on by default for typed results), streaming (`RunStreamingAsync` → `AgentStream<TResult>`), `Conversation` (canonical client-side history; hot/cold compaction, message **and** token budgets via `ITokenCounter`), `IConversationStore` (multi-instance, optimistic concurrency) + `TieredConversationStore` (write-through chain, per-tier circuit breaker), `AgentTelemetry` (spans/metrics/cost), `[Tool]` attribute, agent-as-node graph bridge |
-| `src/Trellis.Graph` | Zero-AI-dependency graph runtime: `StateGraph<TState>`, conditional edges, `AddParallelNode`, streaming events, `InterruptBefore` human-in-the-loop, `ICheckpointer<TState>`, per-node retry/fallback (`NodeResilience<TState>`), `GraphTelemetry`, per-process ThreadId run guard |
+| `src/Trellis.Graph` | Zero-AI-dependency graph runtime: `StateGraph<TState>`, conditional edges, `AddParallelNode`, streaming events, `InterruptBefore` human-in-the-loop, `ICheckpointer<TState>` (+ opt-in `IFencedCheckpointer<TState>`), per-node retry/fallback (`NodeResilience<TState>`), `GraphTelemetry`, `IRunLease` run exclusion (default `InProcessRunLease`) |
+| `src/Trellis.Graph.Leasing` | `SharedStateRunLease` — cross-instance graph run exclusion over any `IAtomicSharedStateStore`, so one implementation covers Redis, Cosmos, and any CAS-capable backend. Lease key + separate never-expiring fence counter |
 | `src/Trellis.Routing` | `ModelRouter : IChatClient` — priority tiers + circuit breaker. Strategies: `IFailureClassifier`, `IFailurePolicy`, `IEndpointHealthStore`, `IEndpointSelectionStrategy` (round-robin / weighted SWRR / lowest-latency EMA / lowest-cost / least-loaded). Model aliasing (`IModelAliasResolver`, alias order is the outer routing loop) + `GetCatalogue()`. Capability filtering (`ModelCapabilities`), conversation sync (delta + provider id for server-state endpoints, full replay on failover) |
 | `src/Trellis.State` | `ISharedStateStore` cross-instance KV with atomic `IncrementAsync`/`AppendAsync`/`GetListAsync`; opt-in `IAtomicSharedStateStore` (compare-and-swap); InMemory + `IDistributedCache` bridge (bridge is read-modify-write, no CAS — single-writer only) |
 | `src/Trellis.State.Redis` | Redis provider (StackExchange.Redis 3.x — `StringSetAsync` takes `Expiration`, not TimeSpan); INCR/RPUSH truly atomic; CAS via a Lua script |
@@ -84,6 +85,13 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 - **Streaming never self-heals**: validation runs only after the last token and emitted
   tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
   Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **A lease excludes, a fencing token is what actually protects.** Any timeout-bounded lease can
+  be held by a stalled process past its expiry, so exclusion alone cannot stop a revived holder
+  from writing. `RunLeaseHandle.FencingToken` rises per acquisition and `IFencedCheckpointer`
+  refuses lower tokens *in the same statement as the write* — check-then-write reopens the race.
+  `InProcessRunLease` reports `Unfenced` (0) rather than a per-process counter: tokens that are
+  not globally ordered would reject sound writes and accept stale ones, invisibly. Unfenced
+  writes are therefore always accepted, never compared.
 - **Graph retries are opt-in per node** (nodes are arbitrary user code with side effects),
   never consume `MaxSteps`, never checkpoint a failed attempt, and never retry cancellation.
 - **Telemetry does not instrument the chat call** — M.E.AI's `UseOpenTelemetry()` owns that;
@@ -114,9 +122,9 @@ git tag v0.X.0 && git push origin v0.X.0   # cut a release
 
 Shipped in 0.10.0: streaming agents, token-budget compaction, per-node retry/fallback,
 OpenTelemetry + cost accounting, `IConversationStore`, MCP client support.
+Shipped in 0.12.0: cross-instance graph run leasing with fencing tokens.
 
 - Eval harness for agent outputs (regression-test prompts/validators) — top pick
 - Durable execution semantics (idempotency keys, deterministic replay; Orleans/DTF)
 - Retrieval over the cold conversation archive
 - Postgres checkpointer
-- Cross-instance graph run leasing (the ThreadId guard is still per-process)

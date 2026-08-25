@@ -1,5 +1,6 @@
 using Trellis.Graph.Checkpointing;
 using Trellis.Graph.Diagnostics;
+using Trellis.Graph.Leasing;
 using Trellis.Graph.Resilience;
 
 namespace Trellis.Graph;
@@ -139,7 +140,15 @@ public sealed class StateGraph<TState>
     /// Validates the graph and produces an executable <see cref="CompiledGraph{TState}"/>.
     /// A node with no outgoing edge implicitly routes to <see cref="StateGraph.End"/>.
     /// </summary>
-    public CompiledGraph<TState> Compile(ICheckpointer<TState>? checkpointer = null)
+    /// <param name="checkpointer">Persists progress so a run can resume; null disables both.</param>
+    /// <param name="lease">
+    /// Decides who may run a given thread id. Defaults to <see cref="InProcessRunLease"/>,
+    /// which is exclusive within this process only — supply a distributed lease when more
+    /// than one instance can start the same thread id.
+    /// </param>
+    public CompiledGraph<TState> Compile(
+        ICheckpointer<TState>? checkpointer = null,
+        IRunLease? lease = null)
     {
         if (_entryPoint is null)
         {
@@ -173,7 +182,8 @@ public sealed class StateGraph<TState>
             new Dictionary<string, Func<TState, string>>(_routers),
             new Dictionary<string, NodeResilience<TState>>(_resilience),
             _entryPoint,
-            checkpointer);
+            checkpointer,
+            lease);
     }
 
     private void ThrowIfEdgeExists(string from)

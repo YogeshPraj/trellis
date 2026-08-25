@@ -1,7 +1,9 @@
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
 using Trellis.Graph;
 using Trellis.Graph.Checkpointing;
+using Trellis.Graph.Leasing;
 
 namespace Trellis.Checkpointing.Sqlite;
 
@@ -10,7 +12,13 @@ namespace Trellis.Checkpointing.Sqlite;
 /// so <typeparamref name="TState"/> must round-trip through System.Text.Json.
 /// The checkpoint table is created automatically on first use.
 /// </summary>
-public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
+/// <remarks>
+/// Fencing is enforced in SQL rather than in C#: the guard and the insert are one statement, so
+/// a superseded holder cannot pass the check and then win the write. A database written by an
+/// earlier version gains its <c>fence</c> column on first open, defaulting to zero — which
+/// reads as "never fenced" and so accepts the first fenced write rather than rejecting it.
+/// </remarks>
+public sealed class SqliteCheckpointer<TState> : IFencedCheckpointer<TState>
 {
     private const string TableName = "trellis_checkpoints";
 
@@ -53,19 +61,36 @@ public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
             maxCheckpointsPerThread);
     }
 
-    public async Task SaveAsync(Checkpoint<TState> checkpoint, CancellationToken cancellationToken = default)
+    public Task SaveAsync(Checkpoint<TState> checkpoint, CancellationToken cancellationToken = default) =>
+        SaveFencedAsync(checkpoint, RunLeaseHandle.Unfenced, cancellationToken);
+
+    public async Task SaveFencedAsync(
+        Checkpoint<TState> checkpoint, long fencingToken, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(checkpoint);
+        ArgumentOutOfRangeException.ThrowIfNegative(fencingToken);
         await using SqliteConnection connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
 
+        // The WHERE NOT EXISTS is the fence. Evaluated as part of the insert, so a holder that
+        // stalled and was displaced finds its write refused however long it was gone.
         SqliteCommand command = connection.CreateCommand();
         command.CommandText =
-            $"INSERT INTO {TableName} (thread_id, step, next_node, state_json) VALUES ($thread, $step, $next, $state)";
+            $"""
+             INSERT INTO {TableName} (thread_id, step, next_node, state_json, fence)
+             SELECT $thread, $step, $next, $state, $fence
+             WHERE $fence = 0 OR NOT EXISTS (
+                 SELECT 1 FROM {TableName} WHERE thread_id = $thread AND fence > $fence)
+             """;
         command.Parameters.AddWithValue("$thread", checkpoint.ThreadId);
         command.Parameters.AddWithValue("$step", checkpoint.Step);
         command.Parameters.AddWithValue("$next", checkpoint.NextNode);
         command.Parameters.AddWithValue("$state", JsonSerializer.Serialize(checkpoint.State, _jsonOptions));
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        command.Parameters.AddWithValue("$fence", fencingToken);
+        int written = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        if (written == 0)
+        {
+            throw new RunLeaseLostException(checkpoint.ThreadId, fencingToken);
+        }
 
         if (_maxCheckpointsPerThread is int keep)
         {
@@ -127,6 +152,27 @@ public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
         return new Checkpoint<TState>(threadId, reader.GetInt32(0), reader.GetString(1), state);
     }
 
+    /// <summary>
+    /// Adds the fencing column to a table created by an earlier version. Existing rows get
+    /// fence 0, which reads as "no fenced writer has been here" — so the first real holder is
+    /// accepted rather than being refused by history it had no way to participate in.
+    /// </summary>
+    private static async Task AddFenceColumnIfMissingAsync(
+        SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        SqliteCommand columns = connection.CreateCommand();
+        columns.CommandText = $"SELECT COUNT(*) FROM pragma_table_info('{TableName}') WHERE name = 'fence'";
+        object? present = await columns.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if (Convert.ToInt64(present, CultureInfo.InvariantCulture) > 0)
+        {
+            return;
+        }
+
+        SqliteCommand alter = connection.CreateCommand();
+        alter.CommandText = $"ALTER TABLE {TableName} ADD COLUMN fence INTEGER NOT NULL DEFAULT 0";
+        await alter.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(_connectionString);
@@ -150,11 +196,13 @@ public sealed class SqliteCheckpointer<TState> : ICheckpointer<TState>
                      step INTEGER NOT NULL,
                      next_node TEXT NOT NULL,
                      state_json TEXT NOT NULL,
+                     fence INTEGER NOT NULL DEFAULT 0,
                      created_at TEXT NOT NULL DEFAULT (datetime('now'))
                  );
                  CREATE INDEX IF NOT EXISTS ix_{TableName}_thread ON {TableName} (thread_id, id);
                  """;
             await create.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await AddFenceColumnIfMissingAsync(connection, cancellationToken).ConfigureAwait(false);
             _initialized = true;
         }
 

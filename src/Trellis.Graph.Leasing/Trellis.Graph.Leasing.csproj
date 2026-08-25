@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>Cross-instance run leasing for Trellis.Graph — stop two app instances from executing the same workflow thread id, with fencing tokens that keep a stalled instance from writing stale checkpoints. Works over any Trellis.State provider (Redis, Cosmos, IDistributedCache).</Description>
+    <PackageTags>ai;agents;graph;orchestration;leasing;distributed-lock</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Trellis.Graph\Trellis.Graph.csproj" />
+    <ProjectReference Include="..\Trellis.State\Trellis.State.csproj" />
+  </ItemGroup>
+
+</Project>

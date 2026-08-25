@@ -1,41 +1,43 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using Trellis.Graph.Checkpointing;
 using Trellis.Graph.Diagnostics;
+using Trellis.Graph.Leasing;
 using Trellis.Graph.Resilience;
 
 namespace Trellis.Graph;
 
 /// <summary>An executable graph produced by <see cref="StateGraph{TState}.Compile"/>.</summary>
 /// <remarks>
-/// Concurrent runs on the same thread id would interleave checkpoints and corrupt the
-/// workflow, so this graph rejects them within the process. ⚠ The guard is per-process:
-/// in a multi-instance deployment, route a given thread id to one instance (or otherwise
-/// ensure single-writer semantics) — cross-instance leasing is not provided yet.
+/// Concurrent runs on the same thread id would interleave checkpoints and fork the workflow,
+/// so every run holding a caller-supplied thread id takes an <see cref="IRunLease"/> first.
+/// The default lease is exclusive within one process; pass a distributed one to make it
+/// exclusive across a fleet.
 /// </remarks>
 public sealed class CompiledGraph<TState>
 {
-    private readonly ConcurrentDictionary<string, byte> _activeThreads = new();
     private readonly IReadOnlyDictionary<string, NodeHandler<TState>> _nodes;
     private readonly IReadOnlyDictionary<string, Func<TState, string>> _routers;
     private readonly IReadOnlyDictionary<string, NodeResilience<TState>> _resilience;
     private readonly string _entryPoint;
     private readonly ICheckpointer<TState>? _checkpointer;
+    private readonly IRunLease _lease;
 
     internal CompiledGraph(
         IReadOnlyDictionary<string, NodeHandler<TState>> nodes,
         IReadOnlyDictionary<string, Func<TState, string>> routers,
         IReadOnlyDictionary<string, NodeResilience<TState>> resilience,
         string entryPoint,
-        ICheckpointer<TState>? checkpointer)
+        ICheckpointer<TState>? checkpointer,
+        IRunLease? lease)
     {
         _nodes = nodes;
         _routers = routers;
         _resilience = resilience;
         _entryPoint = entryPoint;
         _checkpointer = checkpointer;
+        _lease = lease ?? new InProcessRunLease();
     }
 
     /// <summary>Runs the graph to completion and returns the final state.</summary>
@@ -65,6 +67,10 @@ public sealed class CompiledGraph<TState>
     /// Rewrites the latest checkpointed state for a thread — typically to apply human edits
     /// while a run is paused at an interrupt, before resuming.
     /// </summary>
+    /// <remarks>
+    /// Takes the thread's lease for the duration, so an edit cannot land underneath a run that
+    /// is still executing. A paused run holds no lease, which is what makes the edit possible.
+    /// </remarks>
     public async Task UpdateStateAsync(
         string threadId,
         Func<TState, TState> update,
@@ -77,12 +83,17 @@ public sealed class CompiledGraph<TState>
             throw new GraphExecutionException("UpdateStateAsync requires the graph to be compiled with a checkpointer.");
         }
 
+        await using RunLeaseHandle handle =
+            await _lease.TryAcquireAsync(threadId, cancellationToken).ConfigureAwait(false)
+            ?? throw new GraphExecutionException(
+                $"Thread '{threadId}' is currently running, so its state cannot be edited. " +
+                "Wait for the run to finish or interrupt it first.");
+
         Checkpoint<TState>? checkpoint = await _checkpointer.LoadAsync(threadId, cancellationToken).ConfigureAwait(false)
             ?? throw new GraphExecutionException($"No checkpoint exists for thread '{threadId}'.");
 
-        await _checkpointer
-            .SaveAsync(checkpoint with { State = update(checkpoint.State) }, cancellationToken)
-            .ConfigureAwait(false);
+        await SaveCheckpointAsync(
+            checkpoint with { State = update(checkpoint.State) }, handle, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -101,34 +112,50 @@ public sealed class CompiledGraph<TState>
         string threadId,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        // A second concurrent run on the same thread id would interleave checkpoints.
+        // A thread id the caller chose can be resumed, so a second run on it would interleave
+        // checkpoints. A generated one is private to this run and needs no lease.
         bool guarded = options?.ThreadId is not null;
-        if (guarded && !_activeThreads.TryAdd(threadId, 0))
-        {
-            throw new GraphExecutionException(
-                $"Thread '{threadId}' is already running on this graph. Await the active run before starting another.");
-        }
+        RunLeaseHandle? handle = guarded
+            ? await _lease.TryAcquireAsync(threadId, cancellationToken).ConfigureAwait(false)
+                ?? throw new GraphExecutionException(
+                    $"Thread '{threadId}' is already running. Await the active run before starting another.")
+            : null;
+
         try
         {
-            await foreach (GraphEvent<TState> evt in StreamCoreAsync(input, options, threadId, cancellationToken).ConfigureAwait(false))
+            // The run stops promptly when the lease goes away rather than executing further
+            // nodes it no longer owns; the fencing token is what guarantees any write already
+            // in flight is refused.
+            using CancellationTokenSource? linked = handle is null
+                ? null
+                : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, handle.Lost);
+
+            await foreach (GraphEvent<TState> evt in StreamCoreAsync(
+                input, options, threadId, handle, linked?.Token ?? cancellationToken, cancellationToken)
+                .ConfigureAwait(false))
             {
                 yield return evt;
             }
         }
         finally
         {
-            if (guarded)
+            if (handle is not null)
             {
-                _activeThreads.TryRemove(threadId, out _);
+                await handle.DisposeAsync().ConfigureAwait(false);
             }
         }
     }
 
+    // runToken is cancelled by the caller OR by losing the lease; callerToken only by the
+    // caller. Keeping both is what lets a lost lease be reported as such instead of as a
+    // cancellation the caller never asked for.
     private async IAsyncEnumerable<GraphEvent<TState>> StreamCoreAsync(
         TState input,
         GraphRunOptions? options,
         string threadId,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        RunLeaseHandle? handle,
+        [EnumeratorCancellation] CancellationToken runToken,
+        CancellationToken callerToken)
     {
         // Stopped by 'using' however the enumeration ends — completion, interrupt, or an
         // exception thrown out of a node. Node spans take its context as an explicit parent
@@ -159,7 +186,7 @@ public sealed class CompiledGraph<TState>
         // Resume from the latest checkpoint when the caller supplied a thread id.
         if (_checkpointer is not null && options?.ThreadId is not null)
         {
-            Checkpoint<TState>? checkpoint = await _checkpointer.LoadAsync(threadId, cancellationToken).ConfigureAwait(false);
+            Checkpoint<TState>? checkpoint = await _checkpointer.LoadAsync(threadId, runToken).ConfigureAwait(false);
             if (checkpoint is not null)
             {
                 state = checkpoint.State;
@@ -171,14 +198,14 @@ public sealed class CompiledGraph<TState>
 
         while (node != StateGraph.End)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            ThrowIfLeaseLost(handle);
+            callerToken.ThrowIfCancellationRequested();
 
             // A resumed run must execute the node it paused in front of instead of pausing again.
             if (!justResumed && interruptBefore?.Contains(node) == true)
             {
-                await _checkpointer!
-                    .SaveAsync(new Checkpoint<TState>(threadId, step, node, state), cancellationToken)
-                    .ConfigureAwait(false);
+                await SaveCheckpointAsync(
+                    new Checkpoint<TState>(threadId, step, node, state), handle, runToken).ConfigureAwait(false);
                 yield return new GraphEvent<TState>(GraphEventType.GraphInterrupted, node, step, state);
                 yield break;
             }
@@ -202,8 +229,8 @@ public sealed class CompiledGraph<TState>
             int attempt = 1;
             while (true)
             {
-                NodeAttempt outcome = await TryRunAsync(
-                    () => handler(state, cancellationToken), node, step, attempt, runContext).ConfigureAwait(false);
+                NodeAttempt outcome = await RunNodeAsync(
+                    () => handler(state, runToken), node, step, attempt, runContext, handle).ConfigureAwait(false);
                 if (outcome.Error is null)
                 {
                     state = outcome.State!;
@@ -212,7 +239,7 @@ public sealed class CompiledGraph<TState>
 
                 NodeRetryDecision decision = resilience?.Retry is INodeRetryPolicy policy
                     ? await policy
-                        .EvaluateAsync(new NodeFailureContext(node, attempt, outcome.Error), cancellationToken)
+                        .EvaluateAsync(new NodeFailureContext(node, attempt, outcome.Error), runToken)
                         .ConfigureAwait(false)
                     : NodeRetryDecision.Stop;
 
@@ -224,7 +251,7 @@ public sealed class CompiledGraph<TState>
                     attempt++;
                     if (decision.Delay > TimeSpan.Zero)
                     {
-                        await Task.Delay(decision.Delay, cancellationToken).ConfigureAwait(false);
+                        await DelayAsync(decision.Delay, runToken, handle).ConfigureAwait(false);
                     }
                     continue;
                 }
@@ -235,9 +262,9 @@ public sealed class CompiledGraph<TState>
                     ExceptionDispatchInfo.Throw(outcome.Error);
                 }
 
-                NodeAttempt recovery = await TryRunAsync(
-                    () => fallback!(state, outcome.Error, cancellationToken),
-                    $"{node} (fallback)", step, attempt, runContext).ConfigureAwait(false);
+                NodeAttempt recovery = await RunNodeAsync(
+                    () => fallback!(state, outcome.Error, runToken),
+                    $"{node} (fallback)", step, attempt, runContext, handle).ConfigureAwait(false);
                 GraphTelemetry.RecordFallback(node, recovery.Error is null);
                 if (recovery.Error is not null)
                 {
@@ -265,12 +292,8 @@ public sealed class CompiledGraph<TState>
 
             yield return new GraphEvent<TState>(GraphEventType.NodeCompleted, node, step, state, next);
 
-            if (_checkpointer is not null)
-            {
-                await _checkpointer
-                    .SaveAsync(new Checkpoint<TState>(threadId, step, next, state), cancellationToken)
-                    .ConfigureAwait(false);
-            }
+            await SaveCheckpointAsync(
+                new Checkpoint<TState>(threadId, step, next, state), handle, runToken).ConfigureAwait(false);
 
             node = next;
         }
@@ -278,13 +301,90 @@ public sealed class CompiledGraph<TState>
         yield return new GraphEvent<TState>(GraphEventType.GraphCompleted, null, step, state);
     }
 
+    /// <summary>
+    /// Writes a checkpoint through the fence when the checkpointer supports one, and plainly
+    /// when it does not — the explicit degrade an <see cref="IFencedCheckpointer{TState}"/>
+    /// exists to make visible.
+    /// </summary>
+    private async Task SaveCheckpointAsync(
+        Checkpoint<TState> checkpoint, RunLeaseHandle? handle, CancellationToken cancellationToken)
+    {
+        if (_checkpointer is null)
+        {
+            return;
+        }
+
+        if (_checkpointer is IFencedCheckpointer<TState> fenced)
+        {
+            await fenced
+                .SaveFencedAsync(checkpoint, handle?.FencingToken ?? RunLeaseHandle.Unfenced, cancellationToken)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        await _checkpointer.SaveAsync(checkpoint, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void ThrowIfLeaseLost(RunLeaseHandle? handle)
+    {
+        if (handle is not null && handle.Lost.IsCancellationRequested)
+        {
+            throw new RunLeaseLostException(handle.ThreadId, handle.FencingToken);
+        }
+    }
+
     /// <summary>One node (or fallback) execution: the new state, or the exception it threw.</summary>
     private readonly record struct NodeAttempt(TState? State, Exception? Error);
 
     /// <summary>
+    /// Runs a node and translates a cancellation caused by lease loss into
+    /// <see cref="RunLeaseLostException"/>, so losing the thread never looks like the caller
+    /// having cancelled.
+    /// </summary>
+    private static async Task<NodeAttempt> RunNodeAsync(
+        Func<Task<TState>> body,
+        string node,
+        int step,
+        int attempt,
+        ActivityContext parent,
+        RunLeaseHandle? handle)
+    {
+        try
+        {
+            return await TryRunAsync(body, node, step, attempt, parent).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex)
+        {
+            ThrowIfLeaseLostOnCancel(handle, ex);
+            throw;
+        }
+    }
+
+    private static async Task DelayAsync(TimeSpan delay, CancellationToken runToken, RunLeaseHandle? handle)
+    {
+        try
+        {
+            await Task.Delay(delay, runToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex)
+        {
+            ThrowIfLeaseLostOnCancel(handle, ex);
+            throw;
+        }
+    }
+
+    private static void ThrowIfLeaseLostOnCancel(RunLeaseHandle? handle, OperationCanceledException cause)
+    {
+        if (handle is not null && handle.Lost.IsCancellationRequested)
+        {
+            throw new RunLeaseLostException(handle.ThreadId, handle.FencingToken, cause);
+        }
+    }
+
+    /// <summary>
     /// Runs a node body under its own span and captures failure instead of throwing, so the
     /// caller — an iterator that cannot <c>yield</c> from inside a <c>catch</c> — can emit
-    /// retry events. Cancellation is never captured: it means the caller gave up, not that
+    /// retry events. Cancellation is never captured: it means the run is over, not that
     /// the node failed.
     /// </summary>
     private static async Task<NodeAttempt> TryRunAsync(

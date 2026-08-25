@@ -33,6 +33,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🕸️ **Graph workflow engine** — model multi-step processes as a state machine: nodes transform your state object, fixed or conditional edges decide what runs next, and the graph shape is validated at compile time.
 - 📡 **Streaming execution** — observe every step live via `IAsyncEnumerable`: node started, node completed, graph completed — perfect for progress UIs and logging.
 - 💾 **Checkpointing & resume** — pluggable `ICheckpointer<TState>` records progress after every node; rerun with the same `ThreadId` and the workflow picks up exactly where it stopped.
+- 🔒 **Cross-instance run leasing** — two app instances can no longer execute the same workflow thread id. A run takes an `IRunLease` first, and its **fencing token** means an instance that stalled past its lease can't wake up and write stale checkpoints — the store refuses the write.
 - 🔁 **Per-node retry & fallback** — give any node an `INodeRetryPolicy` (capped exponential backoff with jitter by default) and a fallback that turns a dead dependency into a degraded state instead of a dead workflow.
 - 🌀 **Loop protection** — a `MaxSteps` guard stops runaway cycles before they burn tokens.
 - 🔌 **Provider-agnostic** — anything with an `IChatClient` works; swap OpenAI for Ollama with one line.
@@ -265,6 +266,37 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
 
 If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
+### Cross-instance run leasing
+
+Everything else in Trellis is built for multiple instances — the conversation store does real compare-and-swap, circuit-breaker health is fleet-shared. Graph runs were the exception: the guard against two concurrent runs on one thread id was a per-process `HashSet`, so two app-service instances would each start the same workflow, interleave their checkpoints, and fork it silently.
+
+A run with a caller-supplied `ThreadId` now takes a lease first. The default is in-process, so nothing changes for a single-instance app:
+
+```csharp
+var lease = new SharedStateRunLease(redisStore);           // any IAtomicSharedStateStore
+CompiledGraph<S> graph = builder.Compile(checkpointer, lease);
+```
+
+A second instance calling `RunAsync` with a thread id someone else holds gets a `GraphExecutionException` instead of quietly running in parallel. If the holder crashes, its lease simply stops being renewed and expires — no reaper process, no operator.
+
+**A lease alone is not enough, and it's worth being precise about why.** Any lease bounded by a timeout can be held by a process that has stopped running — a long GC pause, a hypervisor freeze — for longer than the timeout. The lease expires, another instance takes over, and *then* the first instance wakes up still believing it's the holder. No timeout closes that window, because a paused process can't notice time passing.
+
+So the lease hands out a **fencing token** that increases on every acquisition, and an `IFencedCheckpointer<TState>` refuses any write carrying a token lower than one it has already accepted:
+
+```csharp
+// Instance A stalls at token 4. Instance B takes over at token 5 and writes.
+// A wakes up and tries to continue:
+await checkpointer.SaveFencedAsync(checkpoint, fencingToken: 4);  // RunLeaseLostException
+```
+
+The guarantee comes from the storage layer, not the clock. `SqliteCheckpointer` enforces it in SQL — the guard and the insert are one statement, so a superseded holder can't pass the check and then win the write. A database from an earlier version gains its `fence` column on first open.
+
+A run that loses its lease mid-flight stops with `RunLeaseLostException` rather than `OperationCanceledException`, so losing a thread never looks like a cancellation the caller never asked for.
+
+**Degrading honestly.** A checkpointer that doesn't implement `IFencedCheckpointer<TState>` still works — the lease still excludes, only the fence is unavailable. Likewise `InProcessRunLease` reports `Unfenced` rather than inventing a per-process counter, because tokens that aren't globally ordered would reject sound writes and accept stale ones, invisibly.
+
+**Accepted limitation:** the fencing counter is one small key per thread id and is never expired, because expiring it would let a revived holder out-rank the instance that displaced it. If you mint unbounded thread ids, prune those counters with a backend-native TTL set far longer than any run could stall.
 
 ### Typed failure handling
 
@@ -721,7 +753,7 @@ Trellis is an abstraction layer over `IChatClient`. Its tests target the **contr
   ```
 
   then `dotnet test --filter "FullyQualifiedName~CosmosEmulator"`.
-- ⚠️ **Multi-instance notes**: router health state, conversation archives, and the conversation store are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only). Conversations now persist and rehydrate through `IConversationStore` with optimistic concurrency; the graph run-guard remains per-process, so route a given thread id to one instance.
+- ⚠️ **Multi-instance notes**: router health state, conversation archives, and the conversation store are fleet-safe with an atomic backend (Redis); the `IDistributedCache` bridge emulates atomic ops (single-writer only). Conversations persist and rehydrate through `IConversationStore` with optimistic concurrency, and graph runs are guarded across instances by `Trellis.Graph.Leasing` (see below). The router's least-loaded strategy still counts in-flight requests per process.
 
 ## Roadmap
 

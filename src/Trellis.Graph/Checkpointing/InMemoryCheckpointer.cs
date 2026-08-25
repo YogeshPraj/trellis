@@ -1,32 +1,57 @@
 using System.Collections.Concurrent;
+using Trellis.Graph.Leasing;
 
 namespace Trellis.Graph.Checkpointing;
 
 /// <summary>Keeps checkpoints in process memory. Suitable for tests and single-process apps.</summary>
-public sealed class InMemoryCheckpointer<TState> : ICheckpointer<TState>
+/// <remarks>
+/// Fencing is honoured so the fenced path can be exercised without a database, though in a
+/// single process <see cref="InProcessRunLease"/> already makes concurrent runs impossible.
+/// </remarks>
+public sealed class InMemoryCheckpointer<TState> : IFencedCheckpointer<TState>
 {
-    private readonly ConcurrentDictionary<string, List<Checkpoint<TState>>> _threads = new();
+    private readonly ConcurrentDictionary<string, ThreadLog> _threads = new(StringComparer.Ordinal);
 
-    public Task SaveAsync(Checkpoint<TState> checkpoint, CancellationToken cancellationToken = default)
+    /// <summary>One thread's checkpoints and the highest fencing token accepted for it.</summary>
+    private sealed class ThreadLog
+    {
+        public List<Checkpoint<TState>> History { get; } = [];
+
+        public long HighestFence { get; set; }
+    }
+
+    public Task SaveAsync(Checkpoint<TState> checkpoint, CancellationToken cancellationToken = default) =>
+        SaveFencedAsync(checkpoint, RunLeaseHandle.Unfenced, cancellationToken);
+
+    public Task SaveFencedAsync(
+        Checkpoint<TState> checkpoint, long fencingToken, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(checkpoint);
-        List<Checkpoint<TState>> history = _threads.GetOrAdd(checkpoint.ThreadId, _ => []);
-        lock (history)
+        ThreadLog thread = _threads.GetOrAdd(checkpoint.ThreadId, _ => new ThreadLog());
+        lock (thread)
         {
-            history.Add(checkpoint);
+            if (fencingToken != RunLeaseHandle.Unfenced)
+            {
+                if (fencingToken < thread.HighestFence)
+                {
+                    throw new RunLeaseLostException(checkpoint.ThreadId, fencingToken);
+                }
+                thread.HighestFence = fencingToken;
+            }
+            thread.History.Add(checkpoint);
         }
         return Task.CompletedTask;
     }
 
     public Task<Checkpoint<TState>?> LoadAsync(string threadId, CancellationToken cancellationToken = default)
     {
-        if (_threads.TryGetValue(threadId, out List<Checkpoint<TState>>? history))
+        if (_threads.TryGetValue(threadId, out ThreadLog? thread))
         {
-            lock (history)
+            lock (thread)
             {
-                if (history.Count > 0)
+                if (thread.History.Count > 0)
                 {
-                    return Task.FromResult<Checkpoint<TState>?>(history[^1]);
+                    return Task.FromResult<Checkpoint<TState>?>(thread.History[^1]);
                 }
             }
         }
@@ -35,11 +60,11 @@ public sealed class InMemoryCheckpointer<TState> : ICheckpointer<TState>
 
     public Task<IReadOnlyList<Checkpoint<TState>>> GetHistoryAsync(string threadId, CancellationToken cancellationToken = default)
     {
-        if (_threads.TryGetValue(threadId, out List<Checkpoint<TState>>? history))
+        if (_threads.TryGetValue(threadId, out ThreadLog? thread))
         {
-            lock (history)
+            lock (thread)
             {
-                return Task.FromResult<IReadOnlyList<Checkpoint<TState>>>([.. history]);
+                return Task.FromResult<IReadOnlyList<Checkpoint<TState>>>([.. thread.History]);
             }
         }
         return Task.FromResult<IReadOnlyList<Checkpoint<TState>>>([]);
