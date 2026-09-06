@@ -1,4 +1,5 @@
 using Microsoft.Extensions.AI;
+using Trellis.Agents.Middleware;
 using Trellis.Conversations.Compaction;
 using Trellis.Conversations;
 using Trellis.Diagnostics;
@@ -24,6 +25,7 @@ public class Agent<TResult>
     private readonly ConversationCompactor? _compactor;
     private readonly IOutputValidator<TResult>? _outputValidator;
     private readonly OutputRetryOptions? _outputRetry;
+    private readonly IReadOnlyList<IAgentMiddleware<TResult>>? _middleware;
 
     /// <param name="client">The underlying chat client.</param>
     /// <param name="instructions">Optional system instructions prepended to every run.</param>
@@ -49,6 +51,10 @@ public class Agent<TResult>
     /// model asks for, runs. Supply one whenever tools can do anything you would not let an
     /// untrusted caller do, since a model can be steered by any text it reads.
     /// </param>
+    /// <param name="middleware">
+    /// Wraps every buffered run, first entry outermost. ⚠ An agent with middleware refuses to
+    /// stream — see <see cref="IAgentMiddleware{TResult}"/>.
+    /// </param>
     public Agent(
         IChatClient client,
         string? instructions = null,
@@ -57,10 +63,12 @@ public class Agent<TResult>
         ConversationCompactor? compactor = null,
         IOutputValidator<TResult>? outputValidator = null,
         OutputRetryOptions? outputRetry = null,
-        IToolAuthorizer? toolAuthorizer = null)
+        IToolAuthorizer? toolAuthorizer = null,
+        IReadOnlyList<IAgentMiddleware<TResult>>? middleware = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         _instructions = instructions;
+        _middleware = middleware is { Count: > 0 } ? [.. middleware] : null;
         _compactor = compactor;
         _outputValidator = outputValidator;
         _outputRetry = outputRetry;
@@ -95,7 +103,8 @@ public class Agent<TResult>
     {
         ArgumentNullException.ThrowIfNull(messages);
         return AgentRunner.RunAsync(
-            _client, _instructions, _chatOptions, messages, _outputValidator, _outputRetry, cancellationToken);
+            _client, _instructions, _chatOptions, messages, _outputValidator, _outputRetry,
+            cancellationToken, _middleware);
     }
 
     /// <summary>
@@ -115,6 +124,7 @@ public class Agent<TResult>
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(messages);
+        ThrowIfMiddlewareCannotStream();
         return AgentRunner.Stream(
             _client,
             _ => new((
@@ -136,6 +146,7 @@ public class Agent<TResult>
     {
         ArgumentNullException.ThrowIfNull(conversation);
         ArgumentNullException.ThrowIfNull(prompt);
+        ThrowIfMiddlewareCannotStream();
 
         return AgentRunner.Stream(
             _client,
@@ -165,6 +176,23 @@ public class Agent<TResult>
                 }
                 return ValueTask.CompletedTask;
             });
+    }
+
+    /// <summary>
+    /// Refuses to stream when middleware is configured. A streaming run has no result to hand
+    /// middleware until the last token, and tokens already emitted cannot be withdrawn — so the
+    /// pipeline could not do its job. Skipping it quietly would mean a guardrail that protects
+    /// one code path and not the other, which is worse than not offering the path.
+    /// </summary>
+    private void ThrowIfMiddlewareCannotStream()
+    {
+        if (_middleware is not null)
+        {
+            throw new NotSupportedException(
+                "This agent has middleware, which runs on buffered runs only, so streaming would " +
+                "silently bypass it. Use RunAsync, or build a second agent without middleware for " +
+                "the streaming path.");
+        }
     }
 
     /// <summary>The rolling summary (when the conversation has been compacted) plus the hot history.</summary>
@@ -210,7 +238,9 @@ public class Agent<TResult>
         options.ConversationId = conversation.RoutingId;
 
         AgentRunResult<TResult> result = await AgentRunner
-            .RunAsync(_client, _instructions, options, payload, _outputValidator, _outputRetry, cancellationToken)
+            .RunAsync(
+                _client, _instructions, options, payload, _outputValidator, _outputRetry,
+                cancellationToken, _middleware)
             .ConfigureAwait(false);
         conversation.AddRange(result.Response.Messages);
         conversation.RecordUsage(result.Response.Usage);
@@ -235,8 +265,12 @@ public sealed class Agent : Agent<string>
         bool autoInvokeTools = true,
         ConversationCompactor? compactor = null,
         IOutputValidator<string>? outputValidator = null,
-        OutputRetryOptions? outputRetry = null)
-        : base(client, instructions, tools, autoInvokeTools, compactor, outputValidator, outputRetry)
+        OutputRetryOptions? outputRetry = null,
+        IToolAuthorizer? toolAuthorizer = null,
+        IReadOnlyList<IAgentMiddleware<string>>? middleware = null)
+        : base(
+            client, instructions, tools, autoInvokeTools, compactor, outputValidator, outputRetry,
+            toolAuthorizer, middleware)
     {
     }
 }

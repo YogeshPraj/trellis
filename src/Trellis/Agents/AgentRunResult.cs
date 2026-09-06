@@ -9,8 +9,22 @@ namespace Trellis.Agents;
 /// <summary>The outcome of a single agent run: the typed output plus the raw response.</summary>
 public sealed class AgentRunResult<TResult>
 {
-    internal AgentRunResult(TResult output, ChatResponse response, int attempts = 1)
+    /// <summary>
+    /// Builds a result. Public because <see cref="Middleware.IAgentMiddleware{TResult}"/> has to
+    /// be able to produce one — a pipeline that can only observe cannot serve a cached answer,
+    /// substitute a safe reply, or refuse without reaching a model.
+    /// </summary>
+    /// <param name="output">The typed output.</param>
+    /// <param name="response">
+    /// The underlying response. Middleware answering without a model call can pass an empty
+    /// <see cref="ChatResponse"/>; it must not be null, since callers read
+    /// <see cref="Usage"/> and <see cref="Response"/> unconditionally.
+    /// </param>
+    /// <param name="attempts">How many model calls the run made.</param>
+    public AgentRunResult(TResult output, ChatResponse response, int attempts = 1)
     {
+        ArgumentNullException.ThrowIfNull(response);
+        ArgumentOutOfRangeException.ThrowIfNegative(attempts);
         Output = output;
         Response = response;
         Attempts = attempts;

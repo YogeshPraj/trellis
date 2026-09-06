@@ -2,6 +2,7 @@ using Microsoft.Extensions.AI;
 using Trellis.Conversations.Compaction;
 using Trellis.Conversations;
 using Trellis.Diagnostics;
+using Trellis.Agents.Middleware;
 using Trellis.Outputs;
 using Trellis.Tools;
 
@@ -19,6 +20,7 @@ public class Agent<TDeps, TResult>
     private readonly IChatClient _client;
     private readonly string? _instructions;
     private readonly Func<TDeps, IReadOnlyList<AITool>> _toolFactory;
+    private readonly IReadOnlyList<IAgentMiddleware<TResult>>? _middleware;
     private readonly IOutputValidator<TResult>? _outputValidator;
     private readonly OutputRetryOptions? _outputRetry;
 
@@ -40,6 +42,10 @@ public class Agent<TDeps, TResult>
     /// Gates every tool call before it runs. Null (the default) means no gate. Applied to each
     /// run's freshly built tool set, so a per-run dependency cannot hand back an ungated tool.
     /// </param>
+    /// <param name="middleware">
+    /// Wraps every buffered run, first entry outermost. ⚠ An agent with middleware refuses to
+    /// stream — see <see cref="IAgentMiddleware{TResult}"/>.
+    /// </param>
     public Agent(
         IChatClient client,
         Func<TDeps, IReadOnlyList<AITool>> tools,
@@ -47,10 +53,12 @@ public class Agent<TDeps, TResult>
         bool autoInvokeTools = true,
         IOutputValidator<TResult>? outputValidator = null,
         OutputRetryOptions? outputRetry = null,
-        IToolAuthorizer? toolAuthorizer = null)
+        IToolAuthorizer? toolAuthorizer = null,
+        IReadOnlyList<IAgentMiddleware<TResult>>? middleware = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(tools);
+        _middleware = middleware is { Count: > 0 } ? [.. middleware] : null;
         _client = autoInvokeTools ? client.AsBuilder().UseFunctionInvocation().Build() : client;
         _toolFactory = toolAuthorizer is null
             ? tools
@@ -79,7 +87,8 @@ public class Agent<TDeps, TResult>
         ArgumentNullException.ThrowIfNull(messages);
         var options = new ChatOptions { Tools = [.. _toolFactory(deps)] };
         return AgentRunner.RunAsync(
-            _client, _instructions, options, messages, _outputValidator, _outputRetry, cancellationToken);
+            _client, _instructions, options, messages, _outputValidator, _outputRetry,
+            cancellationToken, _middleware);
     }
 
     /// <summary>Runs the agent with this run's dependencies, streaming updates as they arrive.</summary>
@@ -99,6 +108,13 @@ public class Agent<TDeps, TResult>
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(messages);
+        if (_middleware is not null)
+        {
+            throw new NotSupportedException(
+                "This agent has middleware, which runs on buffered runs only, so streaming would " +
+                "silently bypass it. Use RunAsync, or build a second agent without middleware for " +
+                "the streaming path.");
+        }
         return AgentRunner.Stream(
             _client,
             _ =>

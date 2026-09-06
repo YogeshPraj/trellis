@@ -14,12 +14,9 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` shipped
 Each of these changes what an *agent*, a *tool*, or a *run* fundamentally is. Adding them
 later means reopening every call site.
 
-- [ ] **1.1 Agent middleware pipeline** — interception around reasoning, acting, reply, and
-  system-prompt construction. We have `DelegatingChatClient` at the model layer (rate
-  limiting, credits, usage recording all compose there) but nothing at the agent lifecycle
-  layer. This is the seam that makes everything below it a plugin instead of core surgery on
-  `AgentRunner`, and it is the concrete answer to "how do we add features as plugins later".
-  **Highest leverage item on this list.**
+- [x] **1.1 Agent middleware pipeline** — shipped 0.14.0. `IAgentMiddleware<TResult>` wraps
+  every buffered run; first entry outermost; may short-circuit or retry. Streaming refuses
+  rather than silently bypassing it. This is the seam 1.3, 1.4, 2.1 and 3.1 hang off.
 
 - [x] **1.2 Tool authorization / permission system** — shipped 0.13.0. `IToolAuthorizer` gates
   every call, allow-list by default, unanimous composition, fails closed, refusals metered.

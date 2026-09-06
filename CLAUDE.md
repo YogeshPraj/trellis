@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.13.0**. 400 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.14.0**. 417 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -85,6 +85,13 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 - **Streaming never self-heals**: validation runs only after the last token and emitted
   tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
   Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **Middleware wraps the run; the payload it edits is scratch.** `IAgentMiddleware<TResult>`
+  composes around `AgentRunner.RunAsync`, so every buffered path (prompt, messages,
+  conversation, per-run deps) gets it from one seam. First entry outermost. What middleware
+  injects into `AgentRunContext.Messages` must never reach a `Conversation` — same rule as
+  self-healing retries — or injected context compounds per turn and is replayed on failover.
+  Streaming **throws** rather than skipping the pipeline: a guardrail covering one code path
+  and not the other is worse than no streaming path.
 - **Tool authorization gates the function, not the loop.** M.E.AI's function-invoking client
   owns tool execution, so a check in Trellis's loop is bypassed by using the client directly —
   `AuthorizingAIFunction` wraps the `AIFunction`. It also must not *throw* to abort: M.E.AI
@@ -131,6 +138,7 @@ Shipped in 0.10.0: streaming agents, token-budget compaction, per-node retry/fal
 OpenTelemetry + cost accounting, `IConversationStore`, MCP client support.
 Shipped in 0.12.0: cross-instance graph run leasing with fencing tokens.
 Shipped in 0.13.0: tool authorization (`IToolAuthorizer`).
+Shipped in 0.14.0: agent middleware pipeline (`IAgentMiddleware<TResult>`).
 See `ROADMAP.md` for the ranked backlog (gap analysis vs AgentScope 2.0 + Cursor's router).
 
 - Eval harness for agent outputs (regression-test prompts/validators) — top pick

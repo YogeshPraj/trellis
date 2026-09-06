@@ -15,6 +15,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 📶 **Streaming agent runs** — `RunStreamingAsync` yields token-by-token updates and, once the stream ends, hands you the same assembled, deserialized, validated `Result` the buffered call would have produced.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - 🔌 **MCP servers as tools** — `Trellis.Mcp` connects agents to Model Context Protocol servers over stdio or HTTP, aggregating several servers with collision-free naming, an allow-list, and failure isolation so one dead server degrades the agent instead of breaking it.
+- 🧅 **Agent middleware** — wrap a run the way `DelegatingChatClient` wraps a model call. Inject retrieved memory, rewrite a system prompt, gate or replace an answer, cache, audit — as plugins, not edits to the runner.
 - 🛡️ **Tool authorization** — an `IToolAuthorizer` gates every tool call before it runs. Without one, whatever the model asks for runs, and a model can be steered by any text it reads. Deny lets the agent adapt; abort stops the run dead. Fails closed.
 - ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
 - 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
@@ -267,6 +268,26 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
 
 If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
+### Agent middleware
+
+Trellis already composes at the model layer — `DelegatingChatClient` is how rate limiting, credit metering, and usage recording stack — and at the tool layer through `IToolAuthorizer`. `IAgentMiddleware<TResult>` is the third seam: the agent run itself, where the payload and the typed result both exist.
+
+```csharp
+var agent = new Agent<string>(client, middleware: [
+    DelegateAgentMiddleware<string>.OnRequest(ctx =>
+        ctx.Messages.Insert(0, new ChatMessage(ChatRole.System, RecallFor(userId)))),
+    new GuardrailMiddleware(),
+]);
+```
+
+First entry is outermost, like ASP.NET Core. Middleware may skip `next` entirely — answering from cache or refusing without touching a model — or call it more than once to retry. `context.Messages` is the assembled payload with the system instructions already at the front, so rewriting a system prompt is just editing a list; `context.Options` is replaceable, and `context.Items` carries state between middleware.
+
+**Injected context never reaches canonical history.** The payload is scratch, rebuilt per run, and a `Conversation` absorbs only the accepted response — the same rule that keeps self-healing retries out of persisted history. Retrieval middleware can inject freely without that context compounding every turn, being persisted, or being replayed on failover. There's a test pinning exactly this.
+
+**Middleware wraps the run, not each attempt.** A run that self-heals through three model calls invokes the pipeline once, because self-healing lives inside a single run.
+
+**Streaming refuses rather than silently skipping.** An agent with middleware throws from `RunStreamingAsync`. A streaming run has no result to hand middleware until the last token, and tokens already emitted cannot be withdrawn — so the pipeline could not do its job. A guardrail that protects `RunAsync` but not `RunStreamingAsync` is worse than not offering the streaming path, so this fails loudly.
 
 ### Tool authorization
 

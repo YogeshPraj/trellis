@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text;
 using Trellis.Conversations.Compaction;
 using Trellis.Conversations;
+using Trellis.Agents.Middleware;
 using Trellis.Diagnostics;
 using Trellis.Outputs;
 
@@ -33,15 +34,21 @@ internal static class AgentRunner
         IEnumerable<ChatMessage> messages,
         IOutputValidator<TResult>? validator,
         OutputRetryOptions? retryOptions,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<IAgentMiddleware<TResult>>? middleware = null)
     {
+        // The span covers the middleware too: injecting memory or consulting a guardrail is
+        // part of what the run cost, and hiding it would misattribute the latency to the model.
         using Activity? activity = AgentTelemetry.StartRun(typeof(TResult), options, streaming: false);
         long startedAt = Stopwatch.GetTimestamp();
         try
         {
-            AgentRunResult<TResult> result = await RunCoreAsync(
-                client, instructions, options, messages, validator, retryOptions, cancellationToken)
-                .ConfigureAwait(false);
+            var context = new AgentRunContext(BuildPayload(instructions, messages), options, typeof(TResult));
+            AgentRunDelegate<TResult> pipeline = Compose(
+                middleware,
+                (ctx, ct) => RunCoreAsync(client, ctx, validator, retryOptions, ct));
+
+            AgentRunResult<TResult> result = await pipeline(context, cancellationToken).ConfigureAwait(false);
             AgentTelemetry.RecordSuccess(
                 activity, result.Response, result.Attempts, Stopwatch.GetElapsedTime(startedAt));
             return result;
@@ -53,16 +60,38 @@ internal static class AgentRunner
         }
     }
 
+    /// <summary>
+    /// Wraps <paramref name="terminal"/> in the middleware, first entry outermost. Returns the
+    /// terminal untouched when there is none, so a run without middleware allocates nothing.
+    /// </summary>
+    private static AgentRunDelegate<TResult> Compose<TResult>(
+        IReadOnlyList<IAgentMiddleware<TResult>>? middleware, AgentRunDelegate<TResult> terminal)
+    {
+        if (middleware is null || middleware.Count == 0)
+        {
+            return terminal;
+        }
+
+        AgentRunDelegate<TResult> next = terminal;
+        for (int i = middleware.Count - 1; i >= 0; i--)
+        {
+            IAgentMiddleware<TResult> current = middleware[i];
+            AgentRunDelegate<TResult> inner = next;
+            next = (ctx, ct) => current.InvokeAsync(ctx, inner, ct);
+        }
+        return next;
+    }
+
     private static async Task<AgentRunResult<TResult>> RunCoreAsync<TResult>(
         IChatClient client,
-        string? instructions,
-        ChatOptions? options,
-        IEnumerable<ChatMessage> messages,
+        AgentRunContext context,
         IOutputValidator<TResult>? validator,
         OutputRetryOptions? retryOptions,
         CancellationToken cancellationToken)
     {
-        List<ChatMessage> all = BuildPayload(instructions, messages);
+        // Read once, after the middleware has had its say.
+        List<ChatMessage> all = [.. context.Messages];
+        ChatOptions? options = context.Options;
 
         bool plainText = typeof(TResult) == typeof(string);
         if (plainText && validator is null)
