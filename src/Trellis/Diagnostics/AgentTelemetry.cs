@@ -45,6 +45,30 @@ public static class AgentTelemetry
         "{rejection}",
         "Outputs rejected by deserialization or validation, i.e. self-healing retries.");
 
+    private static readonly Counter<long> ToolRefusals = Meter.CreateCounter<long>(
+        "trellis.agent.tool.refusals",
+        "{refusal}",
+        "Tool calls refused by an IToolAuthorizer, by tool and decision.");
+
+    /// <summary>
+    /// Records a refused tool call. Only the tool name and the decision are recorded — never
+    /// the arguments, which are model-controlled and routinely carry user data.
+    /// </summary>
+    internal static void RecordToolAuthorization(string toolName, Tools.ToolAuthorizationDecision decision)
+    {
+        ToolRefusals.Add(
+            1,
+            new KeyValuePair<string, object?>("trellis.tool.name", toolName),
+            new KeyValuePair<string, object?>("trellis.tool.decision", decision.ToString()));
+
+        Activity.Current?.AddEvent(new ActivityEvent(
+            "trellis.tool.refused",
+            tags: [
+                new("trellis.tool.name", toolName),
+                new("trellis.tool.decision", decision.ToString()),
+            ]));
+    }
+
     /// <summary>
     /// Prices runs for the cost metric and the <c>trellis.agent.cost</c> span attribute.
     /// Null (the default) disables cost accounting. Process-wide, like the metric pipeline

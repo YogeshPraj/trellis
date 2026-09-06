@@ -3,6 +3,7 @@ using Trellis.Conversations.Compaction;
 using Trellis.Conversations;
 using Trellis.Diagnostics;
 using Trellis.Outputs;
+using Trellis.Tools;
 
 namespace Trellis.Agents;
 
@@ -43,6 +44,11 @@ public class Agent<TResult>
     /// Self-healing configuration. When null, typed outputs still self-heal with the
     /// defaults (2 correction retries); use <c>MaxRetries = 0</c> to fail fast.
     /// </param>
+    /// <param name="toolAuthorizer">
+    /// Gates every tool call before it runs. Null (the default) means no gate: whatever the
+    /// model asks for, runs. Supply one whenever tools can do anything you would not let an
+    /// untrusted caller do, since a model can be steered by any text it reads.
+    /// </param>
     public Agent(
         IChatClient client,
         string? instructions = null,
@@ -50,7 +56,8 @@ public class Agent<TResult>
         bool autoInvokeTools = true,
         ConversationCompactor? compactor = null,
         IOutputValidator<TResult>? outputValidator = null,
-        OutputRetryOptions? outputRetry = null)
+        OutputRetryOptions? outputRetry = null,
+        IToolAuthorizer? toolAuthorizer = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         _instructions = instructions;
@@ -60,7 +67,10 @@ public class Agent<TResult>
 
         if (tools is { Count: > 0 })
         {
-            _chatOptions = new ChatOptions { Tools = [.. tools] };
+            _chatOptions = new ChatOptions
+            {
+                Tools = [.. toolAuthorizer is null ? tools : tools.WithAuthorization(toolAuthorizer)],
+            };
             _client = autoInvokeTools
                 ? client.AsBuilder().UseFunctionInvocation().Build()
                 : client;

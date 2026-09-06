@@ -15,6 +15,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 📶 **Streaming agent runs** — `RunStreamingAsync` yields token-by-token updates and, once the stream ends, hands you the same assembled, deserialized, validated `Result` the buffered call would have produced.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - 🔌 **MCP servers as tools** — `Trellis.Mcp` connects agents to Model Context Protocol servers over stdio or HTTP, aggregating several servers with collision-free naming, an allow-list, and failure isolation so one dead server degrades the agent instead of breaking it.
+- 🛡️ **Tool authorization** — an `IToolAuthorizer` gates every tool call before it runs. Without one, whatever the model asks for runs, and a model can be steered by any text it reads. Deny lets the agent adapt; abort stops the run dead. Fails closed.
 - ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
 - 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
 - 🤝 **Agents as graph nodes** — `AddAgentNode(...)` drops any agent into a workflow: build the prompt from state, fold the typed result back in.
@@ -266,6 +267,34 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
 
 If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
+### Tool authorization
+
+An agent's tools are its blast radius. By default any tool you hand an agent is callable by whatever the model decides — and a model can be steered by text it read from a web page, a document, or another tool's result. `IToolAuthorizer` puts a gate on that path:
+
+```csharp
+var agent = new Agent<string>(client,
+    tools: [readFile, deleteFile],
+    toolAuthorizer: new AllowListToolAuthorizer(["read_file"]));
+```
+
+It is an allow-list, never a deny-list: a deny-list silently admits every tool added after it was written, which is the wrong direction for a security control to fail. `CompositeToolAuthorizer` stacks policies and requires **unanimity** — "any one may allow" would let a permissive policy quietly cancel a restrictive one. `DelegateToolAuthorizer` covers per-user rules and approval queues, and can inspect the arguments:
+
+```csharp
+new DelegateToolAuthorizer((ctx, ct) => ctx.Arguments["path"] is string p && p.StartsWith("/etc")
+    ? new(ToolAuthorization.Abort("system paths are off limits"))
+    : new(ToolAuthorization.Allow()));
+```
+
+**Deny vs. abort.** Both guarantee the tool body never executes; they differ in what happens next. *Deny* is reported to the model as an ordinary tool result, so the agent can explain itself or take a permitted route — the conversation continues. *Abort* stops the run where it stands, with no further model round trips, so the model never gets to respond to the refusal at all.
+
+**Abort really does stop.** This took some care: `Microsoft.Extensions.AI` treats an exception from a tool as *recoverable* — it feeds the failure back to the model and retries up to three times. A gate that threw would hand the model three more attempts at the thing it was just refused, and burn a round trip each time. Trellis terminates the tool loop instead, which is verified by test: an aborted run makes exactly one model call, a denied one makes two.
+
+**It fails closed.** An authorizer that throws refuses the call. A policy engine being down is not evidence of permission, and failing open would turn every outage into a privilege escalation.
+
+**Where the gate lives.** On the tool itself, not in the agent loop — tool execution is owned by M.E.AI's function-invoking client, so a check in our loop would be bypassed by anyone using the underlying client directly. `WithAuthorization` works on any `AITool`, so hand-written tools, `[Tool]`-generated ones, and MCP tools are all covered identically. Provider-hosted tools (server-side web search, say) pass through unchanged — there is no local call to intercept, and wrapping them would imply a protection that does not exist.
+
+Refusals are counted on `trellis.agent.tool.refusals` by tool and decision. Arguments are never logged: they are model-controlled and routinely carry user data.
 
 ### Cross-instance run leasing
 

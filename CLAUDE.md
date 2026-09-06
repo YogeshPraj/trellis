@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.12.0**. 375 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.13.0**. 400 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -27,7 +27,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
    implementation (see the routing layer for the house style).
    **One public type per file, folders map to namespaces.** `Trellis.Agents`,
    `Trellis.Outputs`, `Trellis.Conversations{.Compaction,.Archive,.Storage}`, `Trellis.Tokens`,
-   `Trellis.Diagnostics`, `Trellis.Tools`; `Trellis.Graph{.Checkpointing,.Resilience,.Diagnostics}`;
+   `Trellis.Diagnostics`, `Trellis.Tools` (incl. `IToolAuthorizer`); `Trellis.Graph{.Checkpointing,.Resilience,.Diagnostics}`;
    `Trellis.Routing{.Selection,.Failures,.Health,.Capabilities}`. Exception: a generic type and
    its same-named non-generic shorthand share a file (`Agent`/`Agent<T>`, `StateGraph`/`StateGraph<T>`).
    ⚠ The `[Tool]` source generator hardcodes `Trellis.Tools.ToolAttribute` — moving that type
@@ -85,6 +85,13 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 - **Streaming never self-heals**: validation runs only after the last token and emitted
   tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
   Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **Tool authorization gates the function, not the loop.** M.E.AI's function-invoking client
+  owns tool execution, so a check in Trellis's loop is bypassed by using the client directly —
+  `AuthorizingAIFunction` wraps the `AIFunction`. It also must not *throw* to abort: M.E.AI
+  treats a tool exception as recoverable and retries it up to `MaximumConsecutiveErrorsPerRequest`
+  (3), handing the model more attempts at what it was refused. Abort sets
+  `FunctionInvokingChatClient.CurrentContext.Terminate` and returns; throwing discards that flag.
+  Authorizers fail closed — a broken policy engine grants nothing.
 - **A lease excludes, a fencing token is what actually protects.** Any timeout-bounded lease can
   be held by a stalled process past its expiry, so exclusion alone cannot stop a revived holder
   from writing. `RunLeaseHandle.FencingToken` rises per acquisition and `IFencedCheckpointer`
@@ -123,6 +130,8 @@ git tag v0.X.0 && git push origin v0.X.0   # cut a release
 Shipped in 0.10.0: streaming agents, token-budget compaction, per-node retry/fallback,
 OpenTelemetry + cost accounting, `IConversationStore`, MCP client support.
 Shipped in 0.12.0: cross-instance graph run leasing with fencing tokens.
+Shipped in 0.13.0: tool authorization (`IToolAuthorizer`).
+See `ROADMAP.md` for the ranked backlog (gap analysis vs AgentScope 2.0 + Cursor's router).
 
 - Eval harness for agent outputs (regression-test prompts/validators) — top pick
 - Durable execution semantics (idempotency keys, deterministic replay; Orleans/DTF)
