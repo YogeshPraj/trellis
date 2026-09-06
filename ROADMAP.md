@@ -25,9 +25,10 @@ later means reopening every call site.
   is audited. AgentScope puts its Permission System directly between Toolkit and
   Reasoning/Acting for exactly this reason.
 
-- [ ] **1.3 Multi-agent messaging and handoff** — we have agent-as-graph-node, which is a
-  primitive, not an architecture. No agent-to-agent messaging, no handoff protocol, no team
-  or manager/worker abstraction. Changes what an `Agent` is, so it belongs above the line.
+- [x] **1.3 Multi-agent messaging and handoff** — shipped 0.16.0. `IAgent<TResult>` common
+  shape, `AgentTeam<TResult>` with model-decided `transfer_to_*` handoff, bounded loops, and
+  nesting for manager/workers. Deliberately *not* built: deterministic speaker-selection
+  policies, which `StateGraph` already expresses.
 
 - [x] **1.4 Workspace — bounded filesystem** — shipped 0.15.0. `IWorkspace` + `LocalWorkspace`
   (link-resolving containment, quotas, read-only) + `WorkspaceTools`, composing with 1.2.

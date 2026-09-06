@@ -1,5 +1,6 @@
 using Microsoft.Extensions.AI;
 using Trellis.Agents.Middleware;
+using Trellis.Agents.Teams;
 using Trellis.Conversations.Compaction;
 using Trellis.Conversations;
 using Trellis.Diagnostics;
@@ -17,7 +18,7 @@ namespace Trellis.Agents;
 /// The result type. Use <see cref="string"/> (or the non-generic <see cref="Agent"/>) for plain text;
 /// any other type is requested from the model as structured JSON output and deserialized.
 /// </typeparam>
-public class Agent<TResult>
+public class Agent<TResult> : IAgent<TResult>
 {
     private readonly IChatClient _client;
     private readonly string? _instructions;
@@ -26,6 +27,7 @@ public class Agent<TResult>
     private readonly IOutputValidator<TResult>? _outputValidator;
     private readonly OutputRetryOptions? _outputRetry;
     private readonly IReadOnlyList<IAgentMiddleware<TResult>>? _middleware;
+    private readonly IToolAuthorizer? _toolAuthorizer;
 
     /// <param name="client">The underlying chat client.</param>
     /// <param name="instructions">Optional system instructions prepended to every run.</param>
@@ -73,20 +75,84 @@ public class Agent<TResult>
         _outputValidator = outputValidator;
         _outputRetry = outputRetry;
 
+        _toolAuthorizer = toolAuthorizer;
+
+        // Wrapped whenever auto-invocation is on, even with no tools at construction: a team
+        // supplies handoff tools per run, and a client that was never wrapped would list them
+        // to the model and then silently never invoke the one it picked.
+        _client = autoInvokeTools ? client.AsBuilder().UseFunctionInvocation().Build() : client;
+
         if (tools is { Count: > 0 })
         {
             _chatOptions = new ChatOptions
             {
                 Tools = [.. toolAuthorizer is null ? tools : tools.WithAuthorization(toolAuthorizer)],
             };
-            _client = autoInvokeTools
-                ? client.AsBuilder().UseFunctionInvocation().Build()
-                : client;
         }
-        else
+    }
+
+    /// <summary>
+    /// How this agent is addressed inside a team. Defaults to "agent"; set it whenever the
+    /// agent joins one, since handoff tools are named from it.
+    /// </summary>
+    public string Name { get; init; } = "agent";
+
+    /// <summary>What this agent is for. Read by other agents deciding whether to hand to it.</summary>
+    public string Description { get; init; } = "A general-purpose agent.";
+
+    /// <summary>
+    /// Takes one turn on behalf of a team: runs normally, but reports a transfer instead of an
+    /// answer when the model called a handoff tool.
+    /// </summary>
+    public async Task<AgentTurn<TResult>> TakeTurnAsync(
+        IEnumerable<ChatMessage> messages,
+        IReadOnlyList<AITool>? additionalTools = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+
+        // Opened before the run so the holder flows down into the tool; a value the tool
+        // assigned to an async-local of its own would never be visible back here.
+        HandoffSignal.Begin();
+        try
         {
-            _client = client;
+            ChatOptions? options = MergeTools(additionalTools);
+            AgentRunResult<TResult> result = await AgentRunner
+                .RunAsync(
+                    _client, _instructions, options, messages, _outputValidator, _outputRetry,
+                    cancellationToken, _middleware)
+                .ConfigureAwait(false);
+            return AgentTurn<TResult>.Answered(result);
         }
+        catch (HandoffRequestedException handoff)
+        {
+            return AgentTurn<TResult>.HandedOff(handoff.Target, handoff.Reason);
+        }
+        finally
+        {
+            HandoffSignal.End();
+        }
+    }
+
+    /// <summary>
+    /// Combines this agent's own tools with any supplied for a single turn, gating the
+    /// newcomers with the same authorizer. A per-run tool that skipped the gate would be a way
+    /// around it.
+    /// </summary>
+    private ChatOptions? MergeTools(IReadOnlyList<AITool>? additionalTools)
+    {
+        if (additionalTools is null or { Count: 0 })
+        {
+            return _chatOptions;
+        }
+
+        IReadOnlyList<AITool> extra = _toolAuthorizer is null
+            ? additionalTools
+            : additionalTools.WithAuthorization(_toolAuthorizer);
+
+        ChatOptions merged = _chatOptions?.Clone() ?? new ChatOptions();
+        merged.Tools = [.. merged.Tools ?? [], .. extra];
+        return merged;
     }
 
     /// <summary>Runs the agent with a single user prompt.</summary>

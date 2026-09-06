@@ -15,6 +15,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 📶 **Streaming agent runs** — `RunStreamingAsync` yields token-by-token updates and, once the stream ends, hands you the same assembled, deserialized, validated `Result` the buffered call would have produced.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - 🔌 **MCP servers as tools** — `Trellis.Mcp` connects agents to Model Context Protocol servers over stdio or HTTP, aggregating several servers with collision-free naming, an allow-list, and failure isolation so one dead server degrades the agent instead of breaking it.
+- 🤝 **Agent teams & handoff** — agents transfer a conversation to each other at run time by calling a `transfer_to_*` tool. A team is itself an agent, so manager/workers needs no extra concept, and a handoff loop is bounded rather than discovered.
 - 🧅 **Agent middleware** — wrap a run the way `DelegatingChatClient` wraps a model call. Inject retrieved memory, rewrite a system prompt, gate or replace an answer, cache, audit — as plugins, not edits to the runner.
 - 📁 **Bounded workspaces** — give an agent a filesystem it cannot climb out of. Every path is resolved link-by-link and refused if it lands outside the root, with size and file-count quotas so a looping agent can't fill a disk.
 - 🛡️ **Tool authorization** — an `IToolAuthorizer` gates every tool call before it runs. Without one, whatever the model asks for runs, and a model can be steered by any text it reads. Deny lets the agent adapt; abort stops the run dead. Fails closed.
@@ -269,6 +270,36 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
 
 If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
+### Agent teams and handoff
+
+Some routing can't be drawn in advance — which specialist should answer depends on what the user actually said. `AgentTeam<TResult>` gives each member a `transfer_to_<name>` tool for every other member and lets the model choose:
+
+```csharp
+var triage  = new Agent<string>(client, "Route the customer.") { Name = "triage" };
+var billing = new Agent<string>(client, "You handle refunds.")
+    { Name = "billing", Description = "refunds, invoices, charges" };
+
+var team = new AgentTeam<string>(triage, [billing]);
+AgentTeamResult<string> result = await team.RunAsync("I was charged twice");
+
+result.AnsweredBy;   // "billing"
+result.Handoffs;     // triage -> billing, with the reason it gave
+```
+
+**This is deliberately the opposite of `StateGraph`.** A graph's route is decided by the author; a team's is decided by the model. A fixed pipeline of agents is a graph, and building it as a team instead pays a model to rediscover an edge you already knew about. Reach for a team only when routing genuinely depends on the request.
+
+**A team is an `IAgent<TResult>`, so teams nest.** Manager/workers is a team whose members are teams — no separate concept. A nested team doesn't expose its members outward, so an outer agent can't address a worker directly and bypass the manager that owns it.
+
+**Handoff loops are bounded.** Two agents that each think the other owns a request will pass it back and forth forever, paying for a model call each time. `MaxHandoffs` (default 8) stops it, and `HandoffLimitException` carries the full trail so you can see which pair of descriptions overlap.
+
+**A handing agent isn't also asked to answer.** The transfer tool terminates that agent's tool loop, so it doesn't pay for a round trip to have the wrong agent answer a question it just declined. For a typed agent this matters more than it sounds: a handoff produces no JSON, so without this the self-healing validator would buy two correction round trips trying to "fix" a response that was never meant to be one.
+
+**The receiving agent sees the whole conversation**, transfer included. Hiding it would leave an agent reading a request with no trace of how it got there, and would break the tool call/result pairing providers require.
+
+**Not durable.** A team run lives in one process. Work that has to survive a restart belongs in a graph with agent nodes and a checkpointer.
+
+**Handoff tools are ordinary tools**, so an `IToolAuthorizer` sees them as `transfer_to_<name>` — useful for forbidding a particular transfer, and a trap if an allow-list forgets to include them, which silently strands that agent.
 
 ### Agent middleware
 

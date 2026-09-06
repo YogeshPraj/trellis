@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.15.0**. 459 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.16.0**. 473 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -85,6 +85,17 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 - **Streaming never self-heals**: validation runs only after the last token and emitted
   tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
   Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **Handoff signalling must flow through a mutable holder, not an AsyncLocal assignment.**
+  An `AsyncLocal` set inside the tool (a deeper context) is invisible to the caller that
+  started the turn — values flow *down*, never back up. `HandoffSignal.Begin()` publishes a
+  holder before the run and the tool mutates it. The transfer tool also sets
+  `FunctionInvokingChatClient.CurrentContext.Terminate`, and `AgentRunner` checks the signal
+  **before materializing**, so a typed agent never pays self-healing retries on a turn that
+  transferred. `Agent<TResult>` now always wraps with `UseFunctionInvocation()` when
+  auto-invoking, even with no tools at construction — otherwise per-run handoff tools are
+  listed to the model and then silently never invoked.
+- **A team's route is model-decided; a graph's is author-decided.** Don't rebuild fixed
+  pipelines as teams. A team is itself an `IAgent<TResult>`, so nesting gives manager/workers.
 - **Workspace containment resolves links segment by segment, not just the leaf.** If an
   intermediate directory is a symlink or junction, the leaf is an ordinary file that resolves
   to itself — a leaf-only check passes while the open reads straight through. `LocalWorkspace`
@@ -148,6 +159,7 @@ Shipped in 0.12.0: cross-instance graph run leasing with fencing tokens.
 Shipped in 0.13.0: tool authorization (`IToolAuthorizer`).
 Shipped in 0.14.0: agent middleware pipeline (`IAgentMiddleware<TResult>`).
 Shipped in 0.15.0: bounded workspaces (`IWorkspace`, `LocalWorkspace`, `WorkspaceTools`).
+Shipped in 0.16.0: agent teams + model-decided handoff (`IAgent<TResult>`, `AgentTeam<TResult>`).
 See `ROADMAP.md` for the ranked backlog (gap analysis vs AgentScope 2.0 + Cursor's router).
 
 - Eval harness for agent outputs (regression-test prompts/validators) — top pick

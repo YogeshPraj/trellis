@@ -5,6 +5,7 @@ using System.Text;
 using Trellis.Conversations.Compaction;
 using Trellis.Conversations;
 using Trellis.Agents.Middleware;
+using Trellis.Agents.Teams;
 using Trellis.Diagnostics;
 using Trellis.Outputs;
 
@@ -100,6 +101,10 @@ internal static class AgentRunner
             ChatResponse plain = await client
                 .GetResponseAsync(all, options, cancellationToken)
                 .ConfigureAwait(false);
+            if (HandoffSignal.Current is { WasRequested: true } plainHandoff)
+            {
+                throw new HandoffRequestedException(plainHandoff.Target!, plainHandoff.Reason);
+            }
             return new AgentRunResult<TResult>((TResult)(object)plain.Text, plain);
         }
 
@@ -114,6 +119,14 @@ internal static class AgentRunner
                 ? await client.GetResponseAsync(all, options, cancellationToken).ConfigureAwait(false)
                 : await client.GetResponseAsync<TResult>(all, options, cancellationToken: cancellationToken)
                     .ConfigureAwait(false);
+
+            // Checked before materializing: a turn that handed off never produced an answer,
+            // so validating it would fail, and self-healing would then pay for two correction
+            // round trips to "fix" a response that was never meant to be one.
+            if (HandoffSignal.Current is { WasRequested: true } handoff)
+            {
+                throw new HandoffRequestedException(handoff.Target!, handoff.Reason);
+            }
 
             Materialized<TResult> materialized = await MaterializeAsync(response, validator, cancellationToken)
                 .ConfigureAwait(false);
