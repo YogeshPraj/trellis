@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.14.0**. 417 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.15.0**. 459 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -27,7 +27,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
    implementation (see the routing layer for the house style).
    **One public type per file, folders map to namespaces.** `Trellis.Agents`,
    `Trellis.Outputs`, `Trellis.Conversations{.Compaction,.Archive,.Storage}`, `Trellis.Tokens`,
-   `Trellis.Diagnostics`, `Trellis.Tools` (incl. `IToolAuthorizer`); `Trellis.Graph{.Checkpointing,.Resilience,.Diagnostics}`;
+   `Trellis.Diagnostics`, `Trellis.Tools` (incl. `IToolAuthorizer`), `Trellis.Workspaces`; `Trellis.Graph{.Checkpointing,.Resilience,.Diagnostics}`;
    `Trellis.Routing{.Selection,.Failures,.Health,.Capabilities}`. Exception: a generic type and
    its same-named non-generic shorthand share a file (`Agent`/`Agent<T>`, `StateGraph`/`StateGraph<T>`).
    ⚠ The `[Tool]` source generator hardcodes `Trellis.Tools.ToolAttribute` — moving that type
@@ -85,6 +85,14 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 - **Streaming never self-heals**: validation runs only after the last token and emitted
   tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
   Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **Workspace containment resolves links segment by segment, not just the leaf.** If an
+  intermediate directory is a symlink or junction, the leaf is an ordinary file that resolves
+  to itself — a leaf-only check passes while the open reads straight through. `LocalWorkspace`
+  re-walks from the root, jumping to the real target at each link and re-checking containment.
+  ⚠ It bounds an agent, it does not sandbox a process: check-then-open is two steps, so a
+  writer inside the workspace can still win that race. Say "bounded", never "sandboxed".
+  Also: Windows junctions need no admin, symlinks do — link tests use whichever works, and a
+  recursive delete trips over a junction, so test cleanup must unlink reparse points first.
 - **Middleware wraps the run; the payload it edits is scratch.** `IAgentMiddleware<TResult>`
   composes around `AgentRunner.RunAsync`, so every buffered path (prompt, messages,
   conversation, per-run deps) gets it from one seam. First entry outermost. What middleware
@@ -139,6 +147,7 @@ OpenTelemetry + cost accounting, `IConversationStore`, MCP client support.
 Shipped in 0.12.0: cross-instance graph run leasing with fencing tokens.
 Shipped in 0.13.0: tool authorization (`IToolAuthorizer`).
 Shipped in 0.14.0: agent middleware pipeline (`IAgentMiddleware<TResult>`).
+Shipped in 0.15.0: bounded workspaces (`IWorkspace`, `LocalWorkspace`, `WorkspaceTools`).
 See `ROADMAP.md` for the ranked backlog (gap analysis vs AgentScope 2.0 + Cursor's router).
 
 - Eval harness for agent outputs (regression-test prompts/validators) — top pick

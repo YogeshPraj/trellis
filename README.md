@@ -16,6 +16,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - 🔌 **MCP servers as tools** — `Trellis.Mcp` connects agents to Model Context Protocol servers over stdio or HTTP, aggregating several servers with collision-free naming, an allow-list, and failure isolation so one dead server degrades the agent instead of breaking it.
 - 🧅 **Agent middleware** — wrap a run the way `DelegatingChatClient` wraps a model call. Inject retrieved memory, rewrite a system prompt, gate or replace an answer, cache, audit — as plugins, not edits to the runner.
+- 📁 **Bounded workspaces** — give an agent a filesystem it cannot climb out of. Every path is resolved link-by-link and refused if it lands outside the root, with size and file-count quotas so a looping agent can't fill a disk.
 - 🛡️ **Tool authorization** — an `IToolAuthorizer` gates every tool call before it runs. Without one, whatever the model asks for runs, and a model can be steered by any text it reads. Deny lets the agent adapt; abort stops the run dead. Fails closed.
 - ⚡ **`[Tool]` source generation** — mark methods with `[Tool]` and a Roslyn source generator emits `CreateTools()` at compile time. No assembly scanning, no reflection-based discovery.
 - 💉 **Dependency-injected agents** — `Agent<TDeps, TResult>` builds its tool set per run from a typed dependencies object, so tools can use your services (database, current user, HTTP clients) with full compile-time checking.
@@ -288,6 +289,34 @@ First entry is outermost, like ASP.NET Core. Middleware may skip `next` entirely
 **Middleware wraps the run, not each attempt.** A run that self-heals through three model calls invokes the pipeline once, because self-healing lives inside a single run.
 
 **Streaming refuses rather than silently skipping.** An agent with middleware throws from `RunStreamingAsync`. A streaming run has no result to hand middleware until the last token, and tokens already emitted cannot be withdrawn — so the pipeline could not do its job. A guardrail that protects `RunAsync` but not `RunStreamingAsync` is worse than not offering the streaming path, so this fails loudly.
+
+### Workspaces
+
+An agent that can read files can read the wrong files. `IWorkspace` is a bounded place it may work in, and `WorkspaceTools` turns one into `read_file` / `write_file` / `list_files` / `file_exists` / `delete_file`:
+
+```csharp
+var workspace = new LocalWorkspace("/var/agent/scratch",
+    new WorkspaceOptions { MaxFileBytes = 512 * 1024, MaxTotalBytes = 16 * 1024 * 1024 });
+
+var agent = new Agent<string>(client, tools: [.. WorkspaceTools.Create(workspace)]);
+```
+
+Paths are always relative to the root and use `/` on every platform. Refused: `..` anywhere (even when it would land back inside — there's then no path arithmetic to get wrong), absolute and UNC paths, null bytes, alternate data streams (`notes.txt:hidden`), Windows device names (`CON`, `NUL`, `COM1`), and trailing dots or spaces, which Windows strips silently so the name checked stops being the name opened.
+
+**Links are the case that matters.** Textual normalization cannot catch them: every segment of `escape/secret.txt` looks innocent, and `Path.GetFullPath` doesn't follow links. Resolving only the *final* component isn't enough either — if `escape` is a symlink or junction, the leaf is an ordinary file that resolves to itself, so the check passes while the read goes straight through. Trellis re-walks the path one segment at a time from the root, jumping to the real target whenever a segment is a link and re-checking containment after every step. There are tests using real links for both reading and writing.
+
+**Quotas.** Agents fail in loops, and an unbounded workspace turns one confused run into a full disk. Defaults are small on purpose: 1 MiB per file, 64 MiB total, 1,000 files. `IsReadOnly` hands an agent a corpus it can read but not rewrite. Writes go to a temp file and are moved into place, so a crash leaves the previous content rather than a half-written file the next run would read as truth.
+
+**Workspaces and authorization answer different questions** — where a tool may reach, versus whether it runs at all — and compose:
+
+```csharp
+var tools = WorkspaceTools.Create(workspace)
+    .WithAuthorization(new AllowListToolAuthorizer(["read_file", "list_files"]));
+```
+
+**What this is not.** `LocalWorkspace` bounds an agent; it does not contain a hostile process. The check and the open are two steps, so anything that can already write into the workspace directory can swap a directory for a link in between and win the race — and nothing stops other code in the process from calling `File` directly. It constrains the tools built on it, not the process. Running genuinely untrusted output needs OS-level isolation: a container, a VM, a remote sandbox. Those are separate `IWorkspace` implementations, and calling this one a sandbox would claim a guarantee it doesn't make.
+
+**Multi-instance:** a local workspace is local. Two app instances don't share one, so a conversation resumed elsewhere won't find its files. That needs a shared-storage `IWorkspace`.
 
 ### Tool authorization
 

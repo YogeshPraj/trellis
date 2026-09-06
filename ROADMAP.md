@@ -29,9 +29,15 @@ later means reopening every call site.
   primitive, not an architecture. No agent-to-agent messaging, no handoff protocol, no team
   or manager/worker abstraction. Changes what an `Agent` is, so it belongs above the line.
 
-- [ ] **1.4 Workspace / sandboxed execution** — no notion of giving an agent a filesystem or
-  an isolated execution environment (local FS, Docker, remote sandbox). Changes what a *tool*
-  is allowed to do, and is a second security boundary. Depends on 1.2.
+- [x] **1.4 Workspace — bounded filesystem** — shipped 0.15.0. `IWorkspace` + `LocalWorkspace`
+  (link-resolving containment, quotas, read-only) + `WorkspaceTools`, composing with 1.2.
+  ⚠ Still outstanding: *isolated execution*. A container / remote-sandbox `IWorkspace` and any
+  form of process execution are not built, and `LocalWorkspace` explicitly does not sandbox a
+  process. Tracked as 1.5.
+
+- [ ] **1.5 Isolated execution** — a Docker or remote-sandbox `IWorkspace`, and running
+  commands at all. This is what "sandbox" actually requires; 1.4 only bounds paths. Leaf
+  packages, so it stays out of the cloud-neutral core.
 
 ## Tier 2 — Trust. Needed before anything optimizes quality-for-cost.
 
