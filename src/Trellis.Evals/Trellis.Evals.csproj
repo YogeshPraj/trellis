@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>Regression testing for agent outputs — run a suite of cases against an agent, score them programmatically or with a model judge, and compare against a stored baseline with cost, latency, and sampling variance reported alongside quality.</Description>
+    <PackageTags>ai;agents;llm;evaluation;testing;regression</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Trellis\Trellis.csproj" />
+  </ItemGroup>
+
+</Project>

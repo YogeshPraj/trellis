@@ -15,6 +15,7 @@ No new abstraction layer to learn: Trellis sits directly on [`Microsoft.Extensio
 - 📶 **Streaming agent runs** — `RunStreamingAsync` yields token-by-token updates and, once the stream ends, hands you the same assembled, deserialized, validated `Result` the buffered call would have produced.
 - 🔧 **Tools are plain C# methods** — register any delegate as a tool; tool calls are executed automatically in a loop until the model produces its final answer.
 - 🔌 **MCP servers as tools** — `Trellis.Mcp` connects agents to Model Context Protocol servers over stdio or HTTP, aggregating several servers with collision-free naming, an allow-list, and failure isolation so one dead server degrades the agent instead of breaking it.
+- 🧪 **Eval harness** — `Trellis.Evals` answers "did that change make it worse?". Score cases programmatically or with a model judge, store a baseline, and compare — with sampling spread reported so noise isn't mistaken for a regression, and cost reported alongside quality.
 - 🤝 **Agent teams & handoff** — agents transfer a conversation to each other at run time by calling a `transfer_to_*` tool. A team is itself an agent, so manager/workers needs no extra concept, and a handoff loop is bounded rather than discovered.
 - 🧅 **Agent middleware** — wrap a run the way `DelegatingChatClient` wraps a model call. Inject retrieved memory, rewrite a system prompt, gate or replace an answer, cache, audit — as plugins, not edits to the runner.
 - 📁 **Bounded workspaces** — give an agent a filesystem it cannot climb out of. Every path is resolved link-by-link and refused if it lands outside the root, with size and file-count quotas so a looping agent can't fill a disk.
@@ -270,6 +271,39 @@ How it behaves when a deployment hits a 429 / quota exhaustion / outage:
 4. When the cooldown expires, the next request quietly retries it; on success it's restored to full priority automatically.
 
 If *everything* is cooling down, the router either degrades gracefully to the soonest-recovering endpoint (default) or fails fast, per `AllTrippedBehavior`. Streaming fails over too, up until the first token arrives.
+
+### Eval harness
+
+Every other feature here makes an agent do more. This one tells you whether it still does it well. `Trellis.Evals` runs a suite of cases against any `IAgent<TResult>` — a single agent, the same agent on a cheaper model, or a whole team:
+
+```csharp
+var suite = new EvalSuite<string>("support",
+    cases:   [new EvalCase<string>("refund", "I was charged twice") { Rubric = "must offer a refund path" }],
+    scorers: [PredicateScorer<string>.Contains("refund"), new ModelGradedScorer<string>(judgeClient)],
+    options: new EvalOptions { Samples = 5 },
+    costModel: prices);
+
+EvalReport report = await suite.RunAsync(agent);
+File.WriteAllText("baseline.json", report.ToJson());
+```
+
+Then, after any change:
+
+```csharp
+var comparison = EvalComparison.Against(EvalReport.FromJson(baseline), await suite.RunAsync(agent));
+comparison.Regressions;   // moved down by more than the baseline's own spread
+comparison.CostDelta;     // what the change did to spend
+```
+
+**Noise is treated as noise.** Model output varies between identical runs, so a single sample can't separate "this got worse" from "this is a different roll of the dice". Each case can run N times, the report carries min/max next to the mean, and a case only counts as a regression when it drops by **more than the spread the baseline itself showed**. That's a heuristic, not a significance test — and with `Samples = 1` the spread is zero, so every difference looks real. That's a documented consequence with a test pinning it, not a footnote.
+
+**An outage is not a regression.** A case that throws is reported as *errored*, never scored zero, and errored cases are excluded from the mean rather than averaged in. Otherwise a provider 503 files itself as a quality drop, and the one time it matters nobody believes the number.
+
+**Cost sits next to quality**, because the question is almost never "is it good" but "is it good enough for what it costs". Unpriced runs report `null`, not `0` — zero reads as free; null reads as unknown, which is the truth.
+
+**Model-graded scoring, with its limits stated.** `ModelGradedScorer` grades against a rubric using Trellis's own typed output, so the score arrives parsed rather than scraped from prose, and out-of-range grades are clamped. But the judge is a model: it has variance, it costs money on every case, and it is biased toward long confident answers — which is exactly the failure mode of an agent that has started padding. Prefer a predicate where a predicate can express the check.
+
+**A missing case is named, not scored.** Cases the baseline had and the candidate didn't run appear in `MissingCases`, because deleting coverage is a change worth seeing rather than a silent pass.
 
 ### Agent teams and handoff
 

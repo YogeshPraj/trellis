@@ -10,7 +10,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 
 - Repo: https://github.com/YogeshPraj/trellis (public, MIT)
 - Owner: Yogesh Prajapati (`YogeshPraj`)
-- Current version: **0.16.0**. 473 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
+- Current version: **0.17.0**. 497 tests. (0.8.0 tagged; GitHub release with all nupkgs.)
 - NuGet publishing: release workflow pushes on `v*` tags **only if** the `NUGET_API_KEY`
   repo secret exists (not configured yet — packages are attached to GitHub releases).
 
@@ -63,6 +63,7 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 | `src/Trellis.Mcp` | MCP client support (ModelContextProtocol 2.x): `IMcpToolSource` + `McpToolset` (multi-server aggregation, server-name prefixing, allow-list, failure isolation) and the SDK-backed `McpServerToolSource` (stdio/HTTP, lazy connect, cached tool listings) |
 | `src/Trellis.Checkpointing.Sqlite` | Durable checkpointer: WAL, busy_timeout, per-thread retention (default 100). SQLitePCLRaw pinned ≥3.0.5 (CVE in the transitive default) |
 | `src/Trellis.Tools.Generator` | netstandard2.0 incremental source generator: `[Tool]` methods on partial classes → `CreateTools()`. Ships inside the `Trellis` package as an analyzer. Diagnostics TRL001–TRL003 |
+| `src/Trellis.Evals` | Regression testing for agent outputs: `EvalSuite<TResult>` over any `IAgent<TResult>`, programmatic + model-graded scorers, JSON baselines, `EvalComparison` with sampling-spread tolerance and cost deltas |
 | `tests/Trellis.Tests` | xunit; fakes for unit coverage (`FakeChatClient`), NSubstitute for Redis, real-model `OllamaIntegrationTests` with one-retry flake tolerance |
 
 ## Key Invariants (don't break these)
@@ -85,6 +86,12 @@ production-honest alternative in the .NET ecosystem (vs Microsoft Agent Framewor
 - **Streaming never self-heals**: validation runs only after the last token and emitted
   tokens cannot be retracted, so `AgentStream` throws instead of streaming a second answer.
   Conversation mutation is lazy — user turn on first enumeration, reply on completion.
+- **An eval reports; it never decides, and it never turns an incident into a regression.**
+  A case that throws is `Errored`, never scored 0, and errored cases are excluded from the mean
+  — otherwise a provider 503 files itself as a quality drop. A case counts as a regression only
+  when it moves by more than the spread the *baseline* observed; with `Samples = 1` that spread
+  is 0 and everything looks significant, which is documented and tested, not hidden. Cost is
+  `null` when unpriced, never `0` — zero reads as free.
 - **Handoff signalling must flow through a mutable holder, not an AsyncLocal assignment.**
   An `AsyncLocal` set inside the tool (a deeper context) is invisible to the caller that
   started the turn — values flow *down*, never back up. `HandoffSignal.Begin()` publishes a
@@ -160,9 +167,9 @@ Shipped in 0.13.0: tool authorization (`IToolAuthorizer`).
 Shipped in 0.14.0: agent middleware pipeline (`IAgentMiddleware<TResult>`).
 Shipped in 0.15.0: bounded workspaces (`IWorkspace`, `LocalWorkspace`, `WorkspaceTools`).
 Shipped in 0.16.0: agent teams + model-decided handoff (`IAgent<TResult>`, `AgentTeam<TResult>`).
+Shipped in 0.17.0: eval harness (`Trellis.Evals`).
 See `ROADMAP.md` for the ranked backlog (gap analysis vs AgentScope 2.0 + Cursor's router).
 
-- Eval harness for agent outputs (regression-test prompts/validators) — top pick
 - Durable execution semantics (idempotency keys, deterministic replay; Orleans/DTF)
 - Retrieval over the cold conversation archive
 - Postgres checkpointer

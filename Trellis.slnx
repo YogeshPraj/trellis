@@ -5,6 +5,7 @@
     <Project Path="src/Trellis.Credits/Trellis.Credits.csproj" />
     <Project Path="src/Trellis.Graph/Trellis.Graph.csproj" />
     <Project Path="src/Trellis.Mcp/Trellis.Mcp.csproj" />
+    <Project Path="src/Trellis.Evals/Trellis.Evals.csproj" />
     <Project Path="src/Trellis.Graph.Leasing/Trellis.Graph.Leasing.csproj" />
     <Project Path="src/Trellis.RateLimiting/Trellis.RateLimiting.csproj" />
     <Project Path="src/Trellis.Routing/Trellis.Routing.csproj" />

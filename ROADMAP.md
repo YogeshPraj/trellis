@@ -42,9 +42,10 @@ later means reopening every call site.
 
 ## Tier 2 — Trust. Needed before anything optimizes quality-for-cost.
 
-- [ ] **2.1 Eval harness** — regression-test prompts, validators, and cost per case. Nothing
-  today can answer "did that change make outputs worse?". Blocks 2.2, and would be how we
-  prove a middleware refactor regressed nothing.
+- [x] **2.1 Eval harness** — shipped 0.17.0 as `Trellis.Evals`. Suites over any
+  `IAgent<TResult>`, programmatic + model-graded scorers, JSON baselines, comparison that
+  treats movement inside the baseline's own sampling spread as noise, and cost beside quality.
+  **2.2 is now unblocked.**
 
 - [ ] **2.2 Semantic model routing** — `IModelSelectionPolicy` seeing request content, sitting
   above the existing alias resolver (which is already the outer routing loop). Ship the seam
