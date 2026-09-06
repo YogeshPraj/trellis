@@ -14,7 +14,7 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` shipped
 Each of these changes what an *agent*, a *tool*, or a *run* fundamentally is. Adding them
 later means reopening every call site.
 
-- [~] **1.1 Agent middleware pipeline** — interception around reasoning, acting, reply, and
+- [ ] **1.1 Agent middleware pipeline** — interception around reasoning, acting, reply, and
   system-prompt construction. We have `DelegatingChatClient` at the model layer (rate
   limiting, credits, usage recording all compose there) but nothing at the agent lifecycle
   layer. This is the seam that makes everything below it a plugin instead of core surgery on
